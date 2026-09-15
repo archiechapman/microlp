@@ -74,6 +74,13 @@ pub struct SolveOptions {
     /// Cuts tighten the relaxation (fewer nodes) at the cost of larger node LPs.
     /// Default `0` (no cuts).
     pub gomory_rounds: u32,
+    /// Reliability threshold for strong branching. A branching candidate whose
+    /// pseudocosts rest on fewer than this many observations on either side is probed
+    /// by solving both of its children before the branching variable is chosen, and the
+    /// probes' outcomes become pseudocost observations. Probing costs LP solves at the
+    /// top of the tree and buys better branching decisions there; it stops by itself as
+    /// pseudocosts become reliable. Default `0` (pure pseudocost branching).
+    pub strong_branch_reliability: u32,
 }
 
 impl Default for SolveOptions {
@@ -86,6 +93,7 @@ impl Default for SolveOptions {
             warm_start: None,
             tolerances: Tolerances::default(),
             gomory_rounds: 0,
+            strong_branch_reliability: 0,
         }
     }
 }
@@ -218,6 +226,9 @@ pub struct Stats {
     /// Root relaxation bound before any cuts, in user space (`None` for a pure LP or
     /// before the root is solved).
     pub root_lp_bound: Option<f64>,
+    /// Child LPs solved for strong branching (see
+    /// [`SolveOptions::strong_branch_reliability`]).
+    pub strong_branch_lps: u64,
 }
 
 /// A feasible integer assignment, in internal (minimize) objective space.
@@ -271,6 +282,9 @@ pub(crate) struct MipState {
     /// callback instead of becoming incumbents, and nodes are pruned against a
     /// fixed objective cutoff.
     pub enumeration: Option<Enumeration>,
+    /// Strong-branching probes still allowed in this search (see
+    /// [`SolveOptions::strong_branch_reliability`] and `params::SB_BUDGET_PER_INT_VAR`).
+    pub sb_budget: u64,
 }
 
 /// State of an enumeration run (see [`crate::Problem::solve_enumerate`]).
@@ -460,6 +474,12 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         fixed: BTreeMap::new(),
         classifying_unbounded: false,
         enumeration: None,
+        sb_budget: params::SB_BUDGET_PER_INT_VAR
+            * problem
+                .var_domains
+                .iter()
+                .filter(|d| matches!(d, VarDomain::Integer | VarDomain::Boolean))
+                .count() as u64,
     })
 }
 
@@ -1368,10 +1388,11 @@ fn initialize_root(
             IntegralCandidate::Stop => return Ok(Some(TerminationReason::ProvenOptimal)),
         }
     } else {
-        match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
+        match branching::select_branch_var(state, domains, int_tol)? {
             Some(var) => branch(state, &root, var),
             // Fractional integer variables fixed to a non-integer value cannot
-            // produce an integer point or a useful branch.
+            // produce an integer point or a useful branch. Strong branching can also
+            // prove both children infeasible, which says the same about the root.
             None => return Err(Error::Infeasible),
         }
     }
@@ -1482,7 +1503,7 @@ fn visit_node(
         return Ok(NodeVisit::Solved);
     }
 
-    match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
+    match branching::select_branch_var(state, domains, int_tol)? {
         Some(var) => branch(state, &node, var),
         None => {
             state.last_solved_id = None;

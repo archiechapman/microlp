@@ -287,6 +287,10 @@ pub(crate) struct Solver {
     /// Raised by [`Self::refactor_repairing`] when a singular refactorization changed the
     /// basis; a simplex phase consumes it to decide whether it can continue.
     basis_repaired: bool,
+    /// Simplex iteration count at which the current solve gives up with
+    /// [`StopReason::Limit`], for probe solves that must stay cheap (strong branching).
+    /// `None` = no cap. See [`Self::set_iteration_limit`].
+    iteration_limit: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -577,6 +581,7 @@ impl Solver {
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             basis_repaired: false,
+            iteration_limit: None,
         };
 
         debug!(
@@ -971,8 +976,24 @@ impl Solver {
         Ok(StopReason::Finished)
     }
 
+    /// Cap this solve at `iterations` further simplex iterations, after which
+    /// [`Self::reoptimize`] (and the phases it drives) returns [`StopReason::Limit`] with a
+    /// coherent but non-optimal state. `None` clears the cap. Caller-scoped: set it around a
+    /// probe solve and clear it afterwards.
+    pub(crate) fn set_iteration_limit(&mut self, iterations: Option<u64>) {
+        self.iteration_limit = iterations.map(|n| self.lp_iterations + n);
+    }
+
+    fn iterations_exhausted(&self) -> bool {
+        self.iteration_limit
+            .is_some_and(|limit| self.lp_iterations >= limit)
+    }
+
     fn optimize(&mut self) -> Result<StopReason, Error> {
         for iter in 0.. {
+            if self.iterations_exhausted() {
+                return Ok(StopReason::Limit);
+            }
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
@@ -1026,6 +1047,9 @@ impl Solver {
         let was_dual_feasible = self.is_dual_feasible;
 
         for iter in 0.. {
+            if self.iterations_exhausted() {
+                return Ok(StopReason::Limit);
+            }
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
