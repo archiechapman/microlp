@@ -64,6 +64,22 @@ pub(crate) const GOMORY_ROWS_PER_CUT_ROUND: usize = 10;
 /// `GOMORY_MIN_CUTS_PER_ROUND`).
 pub(crate) const GOMORY_ROWS_PER_CUT_TOTAL: usize = 2;
 
+/// Most candidates strong-branched at one node (the best by pseudocost score first).
+/// Probing every fractional variable would cost more than the branching decision is
+/// worth; the classic reliability-branching implementations cap it the same way.
+pub(crate) const SB_MAX_CANDIDATES: usize = 8;
+
+/// Simplex iterations one strong-branching probe may use. A probe is a warm-started
+/// dual solve of a child that differs from the node by a single bound, so it normally
+/// finishes well inside this; the cap bounds the pathological ones, whose result is
+/// then simply not recorded.
+pub(crate) const SB_MAX_ITERS_PER_LP: u64 = 100;
+
+/// Total strong-branching probes allowed in one search, per integer variable. Probing
+/// stops once pseudocosts are reliable, so this is a backstop for models where they
+/// never settle.
+pub(crate) const SB_BUDGET_PER_INT_VAR: u64 = 20;
+
 /// A root cut round "stalls" when it improves the bound by less than this fraction of
 /// `max(1, |bound|)`; two stalled rounds in a row end the loop.
 pub(crate) const GOMORY_STALL_REL: f64 = 1e-5;

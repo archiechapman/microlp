@@ -1,8 +1,9 @@
 //! Branch variable selection.
 
-use super::params::{PSEUDOCOST_INIT_EPS, SCORE_EPS};
-use crate::solver::Solver;
-use crate::VarDomain;
+use super::params::{self, PSEUDOCOST_INIT_EPS, SCORE_EPS};
+use super::MipState;
+use crate::solver::{Basis, Solver};
+use crate::{Error, StopReason, VarDomain};
 
 fn fractionality(val: f64) -> f64 {
     (val - val.round()).abs()
@@ -69,6 +70,12 @@ impl PseudoCosts {
         }
     }
 
+    /// Observations folded in for `var`, as `(down, up)`. Reliability branching
+    /// strong-branches a variable while either side is below its threshold.
+    pub(crate) fn observations(&self, var: usize) -> (u32, u32) {
+        (self.down_n[var], self.up_n[var])
+    }
+
     /// Total number of `record` calls folded in so far, across every variable
     /// and direction. A cheap summary for diagnostics (e.g. `Debug` impls)
     /// that avoids printing the full per-variable vectors.
@@ -113,6 +120,159 @@ pub(crate) fn choose_branch_var(
         }
     }
     best.map(|(v, _)| v)
+}
+
+/// The split point used for `var` at the current LP value: children are
+/// `[lo, k]` and `[k + 1, hi]`. Mirrors `mip::branch`, so a strong-branching probe
+/// solves exactly the child the search would create.
+pub(crate) fn split_point(solver: &Solver, var: usize, int_tol: f64) -> f64 {
+    let val = *solver.get_value(var);
+    let (lo, hi) = solver.get_var_bounds(var);
+    let near = val.round();
+    let k = if (val - near).abs() <= int_tol {
+        near
+    } else {
+        val.floor()
+    };
+    k.clamp(lo, (hi - 1.0).max(lo))
+}
+
+/// One strong-branching probe: solve the child that fixes `var` to `[lo, hi]`, capped at
+/// `params::SB_MAX_ITERS_PER_LP` simplex iterations, then restore the node's bounds and
+/// basis. `Ok(None)` means the probe was cut short (iteration cap or deadline) and says
+/// nothing about the child.
+fn probe(
+    state: &mut MipState,
+    var: usize,
+    (lo, hi): (f64, f64),
+    basis: &Basis,
+) -> Result<Option<ProbeResult>, Error> {
+    let bounds = state.solver.get_var_bounds(var);
+    state.stats.strong_branch_lps += 1;
+    state.sb_budget = state.sb_budget.saturating_sub(1);
+    state
+        .solver
+        .set_var_bounds(var, lo, hi)
+        .expect("probe bounds cannot cross");
+    state.solver.set_iteration_limit(Some(params::SB_MAX_ITERS_PER_LP));
+    let outcome = state.solver.reoptimize();
+    state.solver.set_iteration_limit(None);
+    let result = match outcome {
+        Ok(StopReason::Finished) => Some(ProbeResult::Bound(state.solver.cur_obj_val)),
+        Ok(StopReason::Limit) => None,
+        Err(Error::Infeasible) => Some(ProbeResult::Infeasible),
+        Err(error) => return Err(error),
+    };
+
+    state
+        .solver
+        .set_var_bounds(var, bounds.0, bounds.1)
+        .expect("node bounds cannot cross");
+    if state.solver.load_basis(basis).is_err() {
+        let slack = state.solver.slack_basis();
+        state
+            .solver
+            .load_basis(&slack)
+            .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
+        state.solver.reoptimize()?;
+    }
+    Ok(result)
+}
+
+enum ProbeResult {
+    Bound(f64),
+    Infeasible,
+}
+
+/// Reliability branching: the pseudocost product rule, but a candidate whose pseudocosts
+/// rest on fewer than `SolveOptions::strong_branch_reliability` observations per side is
+/// probed first (see [`probe`]), and the probe's objective degradation is folded into its
+/// pseudocosts. Probing is limited to the best `params::SB_MAX_CANDIDATES` candidates per
+/// node and a global budget, so it fades out as the tree grows — which is the point:
+/// pseudocosts are unreliable exactly at the top, where the branching matters most.
+///
+/// A candidate with one infeasible side is taken immediately (that child is closed before
+/// it is ever solved). `Ok(None)` when nothing can be branched on, including when a
+/// candidate's two sides are both infeasible, which closes the node.
+pub(crate) fn select_branch_var(
+    state: &mut MipState,
+    domains: &[VarDomain],
+    int_tol: f64,
+) -> Result<Option<usize>, Error> {
+    let mut candidates: Vec<usize> = Vec::new();
+    for (v, d) in domains.iter().enumerate() {
+        if !is_int_domain(d) {
+            continue;
+        }
+        let (lo, hi) = state.solver.get_var_bounds(v);
+        if hi - lo < 0.5 {
+            continue;
+        }
+        if fractionality(*state.solver.get_value(v)) > int_tol {
+            candidates.push(v);
+        }
+    }
+    let reliability = state.options.strong_branch_reliability;
+    if candidates.is_empty() || reliability == 0 || state.sb_budget == 0 {
+        return Ok(choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts));
+    }
+
+    let score = |state: &MipState, v: usize| {
+        let val = *state.solver.get_value(v);
+        let f_down = val - val.floor();
+        let f_up = 1.0 - f_down;
+        (state.pseudocosts.estimate(v, false) * f_down).max(SCORE_EPS)
+            * (state.pseudocosts.estimate(v, true) * f_up).max(SCORE_EPS)
+    };
+    candidates.sort_by(|&a, &b| {
+        score(state, b)
+            .total_cmp(&score(state, a))
+            .then(a.cmp(&b))
+    });
+
+    let node_obj = state.solver.cur_obj_val;
+    let basis = state.solver.snapshot_basis();
+    let mut probed = 0;
+    for &v in &candidates {
+        if probed >= params::SB_MAX_CANDIDATES || state.sb_budget == 0 {
+            break;
+        }
+        let (n_down, n_up) = state.pseudocosts.observations(v);
+        if n_down.min(n_up) >= reliability {
+            continue;
+        }
+        probed += 1;
+
+        let val = *state.solver.get_value(v);
+        let (lo, hi) = state.solver.get_var_bounds(v);
+        let k = split_point(&state.solver, v, int_tol);
+        let f_down = (val - k).clamp(0.0, 1.0);
+        let f_up = 1.0 - f_down;
+
+        let down = probe(state, v, (lo, k), &basis)?;
+        let up = probe(state, v, (k + 1.0, hi), &basis)?;
+        // A probe that proves a child infeasible makes this variable the obvious choice:
+        // that subtree dies as soon as the search visits it. The probe only *chooses*
+        // here — it never closes the node itself, so the node budget still accounts for
+        // every node the search concludes anything from.
+        if matches!(down, Some(ProbeResult::Infeasible))
+            || matches!(up, Some(ProbeResult::Infeasible))
+        {
+            debug!("strong branching: var {} has an infeasible child; branching on it", v);
+            return Ok(Some(v));
+        }
+        for (result, up_side, frac) in [(down, false, f_down), (up, true, f_up)] {
+            if let Some(ProbeResult::Bound(obj)) = result {
+                state.pseudocosts.record(
+                    v,
+                    up_side,
+                    (obj - node_obj).max(0.0) / frac.max(params::BRANCH_FRAC_GUARD),
+                );
+            }
+        }
+    }
+
+    Ok(choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts))
 }
 
 #[cfg(test)]
