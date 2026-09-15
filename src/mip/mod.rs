@@ -255,6 +255,129 @@ pub(crate) struct MipState {
     /// relaxation as either integer-feasible (the original MILP is unbounded)
     /// or integer-infeasible.
     pub classifying_unbounded: bool,
+    /// `Some` for a [`crate::Problem::solve_enumerate`] run: candidates go to a
+    /// callback instead of becoming incumbents, and nodes are pruned against a
+    /// fixed objective cutoff.
+    pub enumeration: Option<Enumeration>,
+}
+
+/// State of an enumeration run (see [`crate::Problem::solve_enumerate`]).
+#[derive(Clone, Debug)]
+pub(crate) struct Enumeration {
+    /// Internal (minimize) space: a node or candidate strictly above this is pruned.
+    /// The cutoff is fixed, so a prune is permanent, unlike incumbent pruning.
+    pub cutoff: f64,
+    /// Rows added through [`CandidateAction::Reject`]. They live only in the solver;
+    /// `base` stays the clean user model.
+    pub lazy_rows: usize,
+    /// Candidates handed to the callback.
+    pub candidates: u64,
+    /// The callback asked to stop.
+    pub stopped: bool,
+}
+
+/// What a [`crate::Problem::solve_enumerate`] callback wants done with an
+/// integer candidate.
+#[derive(Clone, Debug)]
+pub enum CandidateAction {
+    /// Add these rows and keep enumerating. They must be globally valid for the
+    /// enumeration (they remove solutions everywhere in the tree, not just below
+    /// the current node) and must cut off the candidate; the node is then
+    /// re-solved with them in place.
+    Reject(Vec<(crate::LinearExpr, ComparisonOp, f64)>),
+    /// End the enumeration now.
+    Stop,
+}
+
+/// Why a [`crate::Problem::solve_enumerate`] run ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnumerateReason {
+    /// The tree is exhausted: no solution within the cutoff satisfies the added
+    /// rows. This is a certificate, as strong as an infeasible solve.
+    Exhausted,
+    /// The callback returned [`CandidateAction::Stop`].
+    Stopped,
+    /// The wall-clock budget ran out; the enumeration is incomplete.
+    TimeLimit,
+    /// The node budget ran out; the enumeration is incomplete.
+    NodeLimit,
+}
+
+/// Result of a [`crate::Problem::solve_enumerate`] run.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct EnumerateOutcome {
+    /// Why the run ended.
+    pub reason: EnumerateReason,
+    /// Search statistics (`best_bound`/`gap` are not meaningful here).
+    pub stats: Stats,
+    /// Rows added through [`CandidateAction::Reject`].
+    pub lazy_rows: usize,
+    /// Candidates passed to the callback.
+    pub candidates: u64,
+}
+
+/// Callback type threaded through the search in enumeration mode.
+pub(crate) type CandidateFn<'a> = dyn FnMut(&[f64], f64) -> CandidateAction + 'a;
+
+/// Run a single-tree enumeration: see [`crate::Problem::solve_enumerate`].
+pub(crate) fn run_enumerate(
+    problem: &Problem,
+    options: SolveOptions,
+    objective_cutoff: f64,
+    on_candidate: &mut CandidateFn<'_>,
+) -> Result<EnumerateOutcome, Error> {
+    if options.warm_start.is_some() {
+        return Err(Error::InvalidOptions(
+            "SolveOptions.warm_start is not supported by solve_enumerate".to_string(),
+        ));
+    }
+    if !objective_cutoff.is_finite() {
+        return Err(Error::InvalidOptions(
+            "solve_enumerate: objective_cutoff must be finite".to_string(),
+        ));
+    }
+    let mut state = build_state(problem, options)?;
+    let internal = match problem.direction {
+        OptimizationDirection::Minimize => objective_cutoff,
+        OptimizationDirection::Maximize => -objective_cutoff,
+    };
+    // Float noise must never prune a solution that sits exactly on the cutoff.
+    let slack = state.options.tolerances.prune_epsilon * internal.abs().max(1.0);
+    state.enumeration = Some(Enumeration {
+        cutoff: internal + slack,
+        lazy_rows: 0,
+        candidates: 0,
+        stopped: false,
+    });
+
+    let started = Instant::now();
+    let result = search_loop(&mut state, Some(on_candidate));
+    state.stats.elapsed += started.elapsed();
+    state.stats.lp_iterations = state.solver.lp_iterations;
+    fill_bound_stats(&mut state);
+
+    let e = state.enumeration.as_ref().expect("enumeration state");
+    let reason = match result {
+        _ if e.stopped => EnumerateReason::Stopped,
+        Ok(TerminationReason::TimeLimit) => EnumerateReason::TimeLimit,
+        Ok(TerminationReason::NodeLimit) => EnumerateReason::NodeLimit,
+        // No incumbent is ever adopted, so a finished tree reports Infeasible.
+        Err(Error::Infeasible) => EnumerateReason::Exhausted,
+        Ok(other) => {
+            return Err(Error::InternalError(format!(
+                "enumeration search ended with unexpected reason {:?}",
+                other
+            )))
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(EnumerateOutcome {
+        reason,
+        stats: state.stats,
+        lazy_rows: e.lazy_rows,
+        candidates: e.candidates,
+    })
 }
 
 impl std::fmt::Debug for MipState {
@@ -324,6 +447,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         base: problem.clone(),
         fixed: BTreeMap::new(),
         classifying_unbounded: false,
+        enumeration: None,
     })
 }
 
@@ -483,7 +607,7 @@ pub(crate) fn resume_run(
 
 fn resume_run_with_deadline(state: &mut MipState) -> Result<TerminationReason, Error> {
     let started = Instant::now();
-    let res = search_loop(state);
+    let res = search_loop(state, None);
     state.stats.elapsed += started.elapsed();
     state.stats.lp_iterations = state.solver.lp_iterations;
     fill_bound_stats(state);
@@ -585,6 +709,150 @@ enum IntegralCandidate {
     Closed,
     Branch(usize),
     Limit,
+    /// Enumeration only: the callback asked to stop.
+    Stop,
+}
+
+/// The enumeration cutoff (internal space), if this is an enumeration run.
+fn enumeration_cutoff(state: &MipState) -> Option<f64> {
+    state.enumeration.as_ref().map(|e| e.cutoff)
+}
+
+/// Enumeration mode's counterpart of [`process_integral_candidate`]: the solver
+/// holds the current node's optimal LP point, integral within `int_tol`.
+///
+/// The rounded point goes through the same validation funnel as an incumbent and
+/// is then handed to the callback, never adopted. On `Reject`, the rows are added
+/// to the live solver and the SAME node is re-solved, repeatedly while the
+/// re-solved point stays integral: it may become fractional (branch), infeasible
+/// or worse than the cutoff (close), or yield the next candidate. Rows are added
+/// before any branching, so a rejected point can never reappear in a child.
+fn enumerate_candidate(
+    state: &mut MipState,
+    domains: &[VarDomain],
+    int_tol: f64,
+    on_candidate: &mut CandidateFn<'_>,
+) -> Result<IntegralCandidate, Error> {
+    let cutoff = enumeration_cutoff(state).expect("enumeration run");
+    let mut retried = false;
+    loop {
+        let feasibility = state.options.tolerances.feasibility;
+        let solver = &state.solver;
+        let mut values: Vec<f64> = (0..solver.num_vars).map(|v| *solver.get_value(v)).collect();
+        for (val, dom) in values.iter_mut().zip(&solver.orig_var_domains) {
+            if matches!(dom, VarDomain::Integer | VarDomain::Boolean) {
+                *val = val.round();
+            }
+        }
+        let valid = candidate_variables_feasible(
+            &values,
+            &solver.orig_var_domains,
+            &state.options.tolerances,
+            |v| state.root_bounds[v],
+        ) && solver.check_constraints(&values, feasibility);
+        let objective = solver.objective_of(&values);
+        if !valid || !objective.is_finite() || objective > cutoff {
+            // Rounding moved the point (infeasible or beyond the cutoff): resolve the
+            // below-tolerance fractionality by branching, as the normal search does.
+            if let Some(var) =
+                branching::choose_branch_var(solver, domains, 0.0, &state.pseudocosts)
+            {
+                return Ok(IntegralCandidate::Branch(var));
+            }
+            if valid && objective.is_finite() {
+                // Exactly integral and feasible, but above the cutoff by float noise
+                // (the node's LP value was within it): not a candidate.
+                return Ok(IntegralCandidate::Closed);
+            }
+            // Exactly integral yet failing the guard: eta drift, as in
+            // `process_integral_candidate`. Closing the node here could lose
+            // solutions, so re-solve it once from the slack basis, then fail loudly.
+            if retried {
+                return Err(Error::InternalError(
+                    "enumeration: exactly integral candidate failed validation after slack-basis retry"
+                        .to_string(),
+                ));
+            }
+            retried = true;
+            debug!("enumeration candidate failed guard; retrying from slack basis");
+            let slack = state.solver.slack_basis();
+            state
+                .solver
+                .load_basis(&slack)
+                .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
+            match solve_node_lp(state)? {
+                NodeLp::Solved => {}
+                NodeLp::Infeasible => {
+                    return Err(Error::InternalError(
+                        "enumeration: integral candidate became infeasible after slack-basis retry"
+                            .to_string(),
+                    ))
+                }
+                NodeLp::Limit => return Ok(IntegralCandidate::Limit),
+            }
+            if state.solver.cur_obj_val > cutoff {
+                return Ok(IntegralCandidate::Closed);
+            }
+            if !branching::is_integral(&state.solver, domains, int_tol) {
+                return Ok(
+                    match branching::choose_branch_var(
+                        &state.solver,
+                        domains,
+                        int_tol,
+                        &state.pseudocosts,
+                    ) {
+                        Some(var) => IntegralCandidate::Branch(var),
+                        None => IntegralCandidate::Closed,
+                    },
+                );
+            }
+            continue;
+        }
+
+        let enumeration = state.enumeration.as_mut().expect("enumeration run");
+        enumeration.candidates += 1;
+        let user_objective = to_user_space(state.direction, objective);
+        let rows = match on_candidate(&values, user_objective) {
+            CandidateAction::Stop => {
+                enumeration.stopped = true;
+                return Ok(IntegralCandidate::Stop);
+            }
+            CandidateAction::Reject(rows) => rows,
+        };
+
+        let num_vars = state.solver.num_vars;
+        let mut prepared = Vec::with_capacity(rows.len());
+        for (expr, op, rhs) in rows {
+            let coeffs = crate::CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
+                .map_err(|error| Error::InvalidOperation(error.2.to_string()))?;
+            prepared.push((coeffs, op, rhs));
+        }
+        let added = state.solver.append_rows(prepared)?;
+        state.enumeration.as_mut().expect("enumeration run").lazy_rows += added;
+        if state.solver.check_constraints(&values, feasibility) {
+            return Err(Error::InvalidOperation(
+                "solve_enumerate: the rows of a Reject must cut off the candidate".to_string(),
+            ));
+        }
+
+        match solve_node_lp(state)? {
+            NodeLp::Solved => {}
+            NodeLp::Infeasible => return Ok(IntegralCandidate::Closed),
+            NodeLp::Limit => return Ok(IntegralCandidate::Limit),
+        }
+        if state.solver.cur_obj_val > cutoff {
+            return Ok(IntegralCandidate::Closed);
+        }
+        if !branching::is_integral(&state.solver, domains, int_tol) {
+            return Ok(
+                match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
+                {
+                    Some(var) => IntegralCandidate::Branch(var),
+                    None => IntegralCandidate::Closed,
+                },
+            );
+        }
+    }
 }
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
@@ -943,6 +1211,7 @@ fn try_warm_start(
 fn initialize_root(
     state: &mut MipState,
     domains: &[VarDomain],
+    on_candidate: Option<&mut CandidateFn<'_>>,
 ) -> Result<Option<TerminationReason>, Error> {
     if state.root_solved {
         return Ok(None);
@@ -970,9 +1239,23 @@ fn initialize_root(
         branch_frac: 1.0,
     };
     let int_tol = state.options.int_tol;
+    if let Some(cutoff) = enumeration_cutoff(state) {
+        if root.lp_bound > cutoff {
+            // Nothing within the cutoff at all: the enumeration is exhausted.
+            return Err(Error::Infeasible);
+        }
+    }
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        let outcome = match on_candidate {
+            Some(on_candidate) => enumerate_candidate(state, domains, int_tol, on_candidate)?,
+            None => process_integral_candidate(state, domains, int_tol)?,
+        };
+        match outcome {
             IntegralCandidate::Branch(var) => branch(state, &root, var),
+            // Enumeration: the root closed, so the tree is exhausted.
+            IntegralCandidate::Closed if state.enumeration.is_some() => {
+                return Err(Error::Infeasible);
+            }
             IntegralCandidate::Closed => {
                 return Ok(Some(TerminationReason::ProvenOptimal));
             }
@@ -980,6 +1263,7 @@ fn initialize_root(
                 state.root_solved = false;
                 return Ok(Some(TerminationReason::TimeLimit));
             }
+            IntegralCandidate::Stop => return Ok(Some(TerminationReason::ProvenOptimal)),
         }
     } else {
         match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts) {
@@ -1001,16 +1285,29 @@ enum NodeVisit {
     /// The node must be restored to the frontier. `lp_solved` distinguishes an
     /// interrupted initial LP from an interrupted retry after a completed LP.
     Interrupted { node: Node, lp_solved: bool },
+    /// Enumeration only: the callback asked to stop (the node's LP was solved).
+    Stopped,
 }
 
 /// Reconstruct and process one node selected by the outer search policy.
-fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result<NodeVisit, Error> {
+fn visit_node(
+    state: &mut MipState,
+    mut node: Node,
+    domains: &[VarDomain],
+    on_candidate: Option<&mut CandidateFn<'_>>,
+) -> Result<NodeVisit, Error> {
     if !apply_node_bounds(state, &node) {
         state.diving = false;
         return Ok(NodeVisit::Pruned);
     }
 
     let warm = state.last_solved_id == Some(node.parent_id);
+    // Rows added lazily after this node's basis was stored have their slacks at the
+    // end of the variable list; they enter as basic (see `Solver::append_rows`).
+    let total = state.solver.num_total_vars();
+    if !warm && node.basis.0.len() < total {
+        node.basis.0.resize(total, crate::solver::VarStatus::Basic);
+    }
     if !warm && state.solver.load_basis(&node.basis).is_err() {
         debug!("basis load failed; falling back to slack basis");
         let slack = state.solver.slack_basis();
@@ -1050,10 +1347,23 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
             return Ok(NodeVisit::Solved);
         }
     }
+    if let Some(cutoff) = enumeration_cutoff(state) {
+        // Strictly worse than the fixed cutoff: a permanent prune. Ties survive; in an
+        // enumeration they are the alternative solutions.
+        if objective > cutoff {
+            state.last_solved_id = None;
+            state.diving = false;
+            return Ok(NodeVisit::Solved);
+        }
+    }
 
     let int_tol = state.options.int_tol;
     if branching::is_integral(&state.solver, domains, int_tol) {
-        match process_integral_candidate(state, domains, int_tol)? {
+        let outcome = match on_candidate {
+            Some(on_candidate) => enumerate_candidate(state, domains, int_tol, on_candidate)?,
+            None => process_integral_candidate(state, domains, int_tol)?,
+        };
+        match outcome {
             IntegralCandidate::Branch(var) => branch(state, &node, var),
             IntegralCandidate::Closed => {
                 state.last_solved_id = None;
@@ -1065,6 +1375,7 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
                     lp_solved: true,
                 })
             }
+            IntegralCandidate::Stop => return Ok(NodeVisit::Stopped),
         }
         return Ok(NodeVisit::Solved);
     }
@@ -1079,11 +1390,17 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
     Ok(NodeVisit::Solved)
 }
 
-fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {
+/// The branch & bound loop. `on_candidate` is `Some` exactly for enumeration runs
+/// (`state.enumeration` set); a callback stop is reported as `ProvenOptimal` with
+/// `Enumeration::stopped` raised, and an exhausted enumeration as `Err(Infeasible)`.
+fn search_loop(
+    state: &mut MipState,
+    mut on_candidate: Option<&mut CandidateFn<'_>>,
+) -> Result<TerminationReason, Error> {
     let domains = state.solver.orig_var_domains.clone();
     state.solver.deadline = state.deadline;
 
-    if let Some(outcome) = initialize_root(state, &domains)? {
+    if let Some(outcome) = initialize_root(state, &domains, on_candidate.as_deref_mut())? {
         return Ok(outcome);
     }
 
@@ -1135,6 +1452,12 @@ fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {
                 continue;
             }
         }
+        if let Some(cutoff) = enumeration_cutoff(state) {
+            if node.lp_bound > cutoff {
+                state.diving = false;
+                continue;
+            }
+        }
 
         // A node budget limits LP solves, not free bookkeeping. Pop and apply
         // the stored-bound prune first so hitting the exact solve count can
@@ -1148,8 +1471,12 @@ fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {
             }
         }
 
-        match visit_node(state, node, &domains)? {
+        match visit_node(state, node, &domains, on_candidate.as_deref_mut())? {
             NodeVisit::Pruned => continue,
+            NodeVisit::Stopped => {
+                state.stats.nodes_solved += 1;
+                return Ok(TerminationReason::ProvenOptimal);
+            }
             NodeVisit::Solved => {
                 state.stats.nodes_solved += 1;
                 nodes_this_run += 1;

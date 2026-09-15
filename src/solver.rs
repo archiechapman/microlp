@@ -929,7 +929,7 @@ impl Solver {
         self.orig_constraints.rows()
     }
 
-    fn num_total_vars(&self) -> usize {
+    pub(crate) fn num_total_vars(&self) -> usize {
         self.num_vars + self.num_constraints()
     }
 
@@ -1102,6 +1102,88 @@ impl Solver {
             self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
         }
         Ok(StopReason::Finished)
+    }
+
+    /// Append constraint rows WITHOUT re-solving (lazy constraints in branch & bound).
+    ///
+    /// Each new row's slack enters the basis, so the basis stays nonsingular (it is
+    /// block-triangular with a unit block) and the reduced costs are unchanged: the new
+    /// basic slacks have zero cost. Only primal feasibility can break — a cut usually
+    /// separates the current point — and its flag is recomputed. New slacks are appended
+    /// after all existing variables, so a stored [`Basis`] stays valid once padded with
+    /// `Basic` for them. Callers re-solve with [`Self::reoptimize`]. Returns the number of
+    /// rows added (empty tautological rows are dropped).
+    pub(crate) fn append_rows(
+        &mut self,
+        rows: Vec<(CsVec, ComparisonOp, f64)>,
+    ) -> Result<usize, Error> {
+        let mut prepared = Vec::with_capacity(rows.len());
+        for (coeffs, cmp_op, rhs) in rows {
+            if let Some(row) = prepare_row(coeffs, cmp_op, rhs)? {
+                prepared.push(row);
+            }
+        }
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+
+        let old_rows = self.num_constraints();
+        let new_total = self.num_total_vars() + prepared.len();
+        let mut new_orig_constraints = CsMat::empty(CompressedStorage::CSR, new_total);
+        for row in self.orig_constraints.outer_iterator() {
+            new_orig_constraints =
+                new_orig_constraints.append_outer_csvec(resized_view(&row, new_total));
+        }
+        let added = prepared.len();
+        for (i, row) in prepared.into_iter().enumerate() {
+            let slack_var = self.num_vars + old_rows + i;
+            let mut lhs_val = 0.0;
+            for (var, &coeff) in row.coeffs.iter() {
+                lhs_val += coeff * *self.get_value(var);
+            }
+            self.orig_obj_coeffs.push(0.0);
+            self.orig_var_mins.push(row.slack_var_min);
+            self.orig_var_maxs.push(row.slack_var_max);
+            self.var_states.push(VarState::Basic(self.basic_vars.len()));
+            self.basic_vars.push(slack_var);
+            self.basic_var_mins.push(row.slack_var_min);
+            self.basic_var_maxs.push(row.slack_var_max);
+            self.basic_var_vals.push(row.rhs - lhs_val);
+            self.orig_rhs.push(row.rhs);
+            self.row_scales.push(row.row_scale);
+
+            let mut coeffs = into_resized(row.coeffs, new_total);
+            coeffs.append(slack_var, 1.0);
+            new_orig_constraints = new_orig_constraints.append_outer_csvec(coeffs.view());
+        }
+        self.orig_constraints = new_orig_constraints;
+        self.orig_constraints_csc = self.orig_constraints.to_csc();
+        // The extended basis is nonsingular iff the old one was, but the old one may be
+        // numerically marginal: repair rather than fail. A repair recomputes values,
+        // reduced costs, flags and the dual weights itself; the caller re-solves anyway.
+        if self.refactor_repairing()? {
+            self.basis_repaired = false;
+            return Ok(added);
+        }
+
+        if self.enable_primal_steepest_edge || self.enable_dual_steepest_edge {
+            // Existing tableau rows are unchanged; add each new row's contribution.
+            for r in old_rows..old_rows + added {
+                self.calc_row_coeffs(r);
+                if self.enable_primal_steepest_edge {
+                    for (c, &coeff) in self.row_coeffs.iter() {
+                        self.primal_edge_sq_norms[c] += coeff * coeff;
+                    }
+                }
+                if self.enable_dual_steepest_edge {
+                    self.dual_edge_sq_norms
+                        .push(self.inv_basis_row_coeffs.sq_norm());
+                }
+            }
+        }
+
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+        Ok(added)
     }
 
     pub(crate) fn add_constraint(

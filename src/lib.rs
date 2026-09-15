@@ -425,7 +425,10 @@ impl Problem {
     }
 }
 
-pub use mip::{ResumeOptions, SolutionStatus, SolveOptions, Stats, TerminationReason, Tolerances};
+pub use mip::{
+    CandidateAction, EnumerateOutcome, EnumerateReason, ResumeOptions, SolutionStatus,
+    SolveOptions, Stats, TerminationReason, Tolerances,
+};
 
 /// Internal signal for whether a simplex operation finished or hit its deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +517,45 @@ impl Problem {
                 resume_options,
             ))
         }
+    }
+
+    /// Enumerates integer solutions within an objective cutoff in ONE branch &
+    /// bound tree, with lazily added rows.
+    ///
+    /// Nodes whose relaxation is strictly worse than `objective_cutoff` (in user
+    /// space: above it when minimizing, below it when maximizing) are pruned, and
+    /// no incumbent is kept, so ties and alternative solutions are all visited.
+    /// Every integer point that passes the usual validation (see
+    /// [`Tolerances::feasibility`]) is passed to `on_candidate` as the
+    /// rounded values of all variables (indexed by [`Variable::idx`]) and its
+    /// objective. The callback either stops the run or rejects the point with rows
+    /// that cut it off; those rows join the model for the rest of the search and
+    /// the node is re-solved. When the tree runs out, the run reports
+    /// [`EnumerateReason::Exhausted`]: no solution within the cutoff satisfies all
+    /// rows added so far.
+    ///
+    /// For example, rejecting every candidate with a no-good cut over the binary
+    /// variables lists all integer solutions within the cutoff.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidOptions`] for invalid options, a warm start, or a
+    /// non-finite cutoff; [`Error::InvalidOperation`] for a problem without
+    /// integer variables or rows that do not cut off the candidate they reject;
+    /// [`Error::InternalError`] when the search cannot continue.
+    pub fn solve_enumerate(
+        &self,
+        options: SolveOptions,
+        objective_cutoff: f64,
+        mut on_candidate: impl FnMut(&[f64], f64) -> CandidateAction,
+    ) -> Result<EnumerateOutcome, Error> {
+        options.validate()?;
+        if !self.has_integer_vars() {
+            return Err(Error::InvalidOperation(
+                "solve_enumerate needs integer variables".to_string(),
+            ));
+        }
+        mip::run_enumerate(self, options, objective_cutoff, &mut on_candidate)
     }
 }
 
