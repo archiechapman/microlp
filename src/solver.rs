@@ -57,6 +57,20 @@ pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
 /// (CLP, HiGHS).
 pub(crate) const PIVOT_TOL: f64 = 1e-7;
 
+/// Gomory cuts ([`Solver::gomory_cuts`]) are only derived from rows whose basic integer
+/// variable is at least this far from an integer; closer rows give weak, unstable cuts.
+pub(crate) const GOMORY_AWAY: f64 = 0.01;
+/// Tableau entries below this are treated as zero when forming a Gomory cut.
+pub(crate) const GOMORY_ZERO: f64 = 1e-11;
+/// Cut coefficients below this fraction of the largest are relaxed away (via bounds).
+pub(crate) const GOMORY_REL_ZERO: f64 = 1e-9;
+/// Largest allowed ratio between a cut's largest and smallest coefficient.
+pub(crate) const GOMORY_MAX_DYNAMISM: f64 = 1e6;
+/// Smallest allowed violation of the current point per unit coefficient norm.
+pub(crate) const GOMORY_MIN_EFFICACY: f64 = 1e-5;
+/// Each cut's right-hand side is relaxed by this fraction of `max(1, |rhs|)`.
+pub(crate) const GOMORY_RHS_SLACK: f64 = 1e-9;
+
 /// Bound on dual/primal simplex alternations in one re-solve (see `settle_phases`).
 /// Each extra round is triggered by a basis repair, which is rare; hitting the bound
 /// means repairs keep undoing progress and is reported as an internal error.
@@ -231,6 +245,10 @@ pub(crate) struct Solver {
     /// these internally; validation multiplies its absolute user tolerance by
     /// the same factor so the public feasibility contract stays unscaled.
     row_scales: Vec<f64>,
+    /// Per row: a cutting plane (implied by the other rows) rather than part of the
+    /// model. Candidate validation skips these, so round-off in a cut can never reject a
+    /// genuinely feasible point.
+    row_is_cut: Vec<bool>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -524,6 +542,7 @@ impl Solver {
             orig_constraints_csc,
             orig_rhs,
             row_scales,
+            row_is_cut: vec![false; num_constraints],
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -596,6 +615,9 @@ impl Solver {
     /// blind to exactly the violations this guard is for.
     pub(crate) fn check_constraints(&self, values: &[f64], tol: f64) -> bool {
         for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
+            if self.row_is_cut[r] {
+                continue;
+            }
             let rhs = self.orig_rhs[r];
             let mut lhs = 0.0;
             for (v, &coeff) in row.iter() {
@@ -1093,10 +1115,12 @@ impl Solver {
     /// separates the current point — and its flag is recomputed. New slacks are appended
     /// after all existing variables, so a stored [`Basis`] stays valid once padded with
     /// `Basic` for them. Callers re-solve with [`Self::reoptimize`]. Returns the number of
-    /// rows added (empty tautological rows are dropped).
+    /// rows added (empty tautological rows are dropped). `are_cuts` marks the rows as
+    /// cutting planes, which [`Self::check_constraints`] does not check.
     pub(crate) fn append_rows(
         &mut self,
         rows: Vec<(CsVec, ComparisonOp, f64)>,
+        are_cuts: bool,
     ) -> Result<usize, Error> {
         let mut prepared = Vec::with_capacity(rows.len());
         for (coeffs, cmp_op, rhs) in rows {
@@ -1132,6 +1156,7 @@ impl Solver {
             self.basic_var_vals.push(row.rhs - lhs_val);
             self.orig_rhs.push(row.rhs);
             self.row_scales.push(row.row_scale);
+            self.row_is_cut.push(are_cuts);
 
             let mut coeffs = into_resized(row.coeffs, new_total);
             coeffs.append(slack_var, 1.0);
@@ -1165,6 +1190,182 @@ impl Solver {
 
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         Ok(added)
+    }
+
+    /// Gomory mixed-integer (GMI) cuts from the current optimal tableau, at most `max_cuts`,
+    /// each as `(coeffs, rhs)` meaning `coeffs · x >= rhs` over the structural variables.
+    ///
+    /// For a basic integer variable with fractional value `b̄` (at least [`GOMORY_AWAY`] from
+    /// an integer), its tableau row `x_B + Σ ᾱ_j x_j = b̄` is rewritten in the non-basic
+    /// variables' distances from the bounds they sit at, `t_j >= 0` (`x_j - l_j` or
+    /// `u_j - x_j`). With `f0 = frac(b̄)` and `a_j` the rewritten coefficients, every
+    /// solution satisfies `Σ g_j t_j >= 1`, where `g_j = f_j/f0` or `(1-f_j)/(1-f0)` for an
+    /// integer `t_j` (`f_j = frac(a_j)`, whichever is smaller) and `a_j/f0` or
+    /// `-a_j/(1-f0)` for a continuous one (Gomory 1960; e.g. Cornuéjols, "Valid inequalities
+    /// for mixed integer linear programs", 2008). The current vertex (all `t_j = 0`)
+    /// violates it. Slack distances are replaced by their rows, giving the cut in `x`.
+    ///
+    /// Cuts are valid for the CURRENT variable bounds (global only at the root). Rows whose
+    /// tableau involves a non-basic variable strictly between its bounds are skipped, tiny
+    /// coefficients are relaxed away using the variable bounds, and cuts with a coefficient
+    /// range above [`GOMORY_MAX_DYNAMISM`] or efficacy below [`GOMORY_MIN_EFFICACY`] are
+    /// dropped. Slacks are treated as continuous. Most fractional rows are tried first.
+    pub(crate) fn gomory_cuts(&mut self, max_cuts: usize) -> Vec<(CsVec, f64)> {
+        let n = self.num_vars;
+        let is_int = |domains: &[VarDomain], v: usize| {
+            v < n && matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
+        };
+
+        let mut rows: Vec<(f64, usize)> = Vec::new();
+        for (r, &var) in self.basic_vars.iter().enumerate() {
+            if !is_int(&self.orig_var_domains, var) {
+                continue;
+            }
+            let f0 = self.basic_var_vals[r] - self.basic_var_vals[r].floor();
+            if (GOMORY_AWAY..=1.0 - GOMORY_AWAY).contains(&f0) {
+                rows.push(((f0 - 0.5).abs(), r));
+            }
+        }
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let point: Vec<f64> = (0..n).map(|v| *self.get_value(v)).collect();
+        let mut coef = vec![0.0; n];
+        let mut in_cut = vec![false; n];
+        let mut touched: Vec<usize> = Vec::new();
+        let mut cuts = Vec::new();
+
+        for &(_, r) in &rows {
+            if cuts.len() >= max_cuts {
+                break;
+            }
+            let f0 = self.basic_var_vals[r] - self.basic_var_vals[r].floor();
+            self.calc_row_coeffs(r);
+            for &j in &touched {
+                coef[j] = 0.0;
+                in_cut[j] = false;
+            }
+            touched.clear();
+            let mut add = |j: usize, c: f64, coef: &mut Vec<f64>| {
+                if !in_cut[j] {
+                    in_cut[j] = true;
+                    touched.push(j);
+                }
+                coef[j] += c;
+            };
+
+            let mut rhs = 1.0;
+            let mut usable = true;
+            for (c, &alpha) in self.row_coeffs.iter() {
+                if alpha.abs() < GOMORY_ZERO {
+                    continue;
+                }
+                let var = self.nb_vars[c];
+                let state = &self.nb_var_states[c];
+                if state.at_min && state.at_max {
+                    continue; // fixed: its distance is identically 0
+                }
+                if !state.at_min && !state.at_max {
+                    usable = false; // strictly between bounds: no valid distance variable
+                    break;
+                }
+                let at_lower = state.at_min;
+                let (lo, hi) = (self.orig_var_mins[var], self.orig_var_maxs[var]);
+                let a = if at_lower { alpha } else { -alpha };
+                let bound = if at_lower { lo } else { hi };
+                let g = if is_int(&self.orig_var_domains, var) && bound == bound.round() {
+                    let fj = a - a.floor();
+                    if fj <= f0 {
+                        fj / f0
+                    } else {
+                        (1.0 - fj) / (1.0 - f0)
+                    }
+                } else if a >= 0.0 {
+                    a / f0
+                } else {
+                    -a / (1.0 - f0)
+                };
+                if g == 0.0 {
+                    continue;
+                }
+                if var < n {
+                    // t = x - lo  or  t = hi - x
+                    if at_lower {
+                        add(var, g, &mut coef);
+                        rhs += g * lo;
+                    } else {
+                        add(var, -g, &mut coef);
+                        rhs -= g * hi;
+                    }
+                } else {
+                    // A slack: s = rhs_i - a_i·x, so t = rhs_i - lo - a_i·x  or
+                    // t = hi - rhs_i + a_i·x.
+                    let i = var - n;
+                    let (sign, constant) = if at_lower {
+                        (-g, g * (self.orig_rhs[i] - lo))
+                    } else {
+                        (g, g * (hi - self.orig_rhs[i]))
+                    };
+                    rhs -= constant;
+                    //guaranteed to be a valid index
+                    for (x, &a_ix) in self.orig_constraints.outer_view(i).unwrap().iter() {
+                        if x < n {
+                            add(x, sign * a_ix, &mut coef);
+                        }
+                    }
+                }
+            }
+            if !usable || !rhs.is_finite() {
+                continue;
+            }
+
+            // Clean up: relax negligible coefficients away with the variable bounds (a
+            // `>=` cut stays valid if `c·x_j` is replaced by its maximum), then reject
+            // numerically dangerous or useless cuts.
+            touched.sort_unstable();
+            let max_abs = touched.iter().map(|&j| coef[j].abs()).fold(0.0, f64::max);
+            if !(max_abs > 0.0) || !max_abs.is_finite() {
+                continue;
+            }
+            let mut idx = Vec::new();
+            let mut vals = Vec::new();
+            for &j in &touched {
+                let c = coef[j];
+                if c.abs() <= GOMORY_REL_ZERO * max_abs {
+                    let bound = if c > 0.0 {
+                        self.orig_var_maxs[j]
+                    } else {
+                        self.orig_var_mins[j]
+                    };
+                    if bound.is_finite() {
+                        rhs -= c * bound;
+                        continue;
+                    }
+                    if c == 0.0 {
+                        continue;
+                    }
+                }
+                idx.push(j);
+                vals.push(c / max_abs);
+            }
+            rhs /= max_abs;
+            if idx.is_empty() || !rhs.is_finite() {
+                continue;
+            }
+            let min_abs = vals.iter().map(|c: &f64| c.abs()).fold(f64::INFINITY, f64::min);
+            if 1.0 / min_abs > GOMORY_MAX_DYNAMISM {
+                continue;
+            }
+            let activity: f64 = idx.iter().zip(&vals).map(|(&j, c)| c * point[j]).sum();
+            let norm = vals.iter().map(|c| c * c).sum::<f64>().sqrt();
+            if (rhs - activity) / norm < GOMORY_MIN_EFFICACY {
+                continue;
+            }
+            // Relax the cut a hair: a cut through a vertex can otherwise pin a variable
+            // exactly onto its bound, where round-off above `EPS` reads as infeasibility.
+            let rhs = rhs - GOMORY_RHS_SLACK * rhs.abs().max(1.0);
+            cuts.push((CsVec::new(n, idx, vals), rhs));
+        }
+        cuts
     }
 
     pub(crate) fn add_constraint(
@@ -1219,6 +1420,7 @@ impl Solver {
 
         self.orig_rhs.push(rhs);
         self.row_scales.push(row_scale);
+        self.row_is_cut.push(false);
 
         self.orig_constraints = new_orig_constraints;
         self.orig_constraints_csc = self.orig_constraints.to_csc();
