@@ -109,6 +109,22 @@ revised simplex** with both primal and dual iterations, steepest-edge pricing, t
 two-pass ratio test for numerical stability, and an LU-factorized basis updated by eta
 matrices (refactorized when the eta file outgrows the factors).
 
+Two safeguards keep that basis usable on ill-conditioned models:
+
+- **Pivot tolerance.** The ratio tests prefer a pivot of at least `PIVOT_TOL` (1e-7) and take
+  a smaller one only when nothing larger exists. An entry just above `EPS` is usually
+  cancellation noise on a coefficient that is zero in exact arithmetic; pivoting on it leaves
+  a basis that refactorizes singular a few pivots later.
+- **Basis repair.** A refactorization that finds a basic column numerically dependent on the
+  columns before it repairs the basis instead of failing: `lu_factorize_repairing` substitutes
+  the unit column of a row that has no pivot yet and whose slack is non-basic, and
+  `Solver::refactor_repairing` swaps that slack into the basis (the evicted variable goes
+  non-basic at its nearest finite bound; a free variable keeps its value).
+
+Both can cost the feasibility a running phase relies on, so both set the feasibility flags
+honestly and the entry points settle through `settle_phases`, which alternates the phases
+until primal and dual feasibility hold together.
+
 State you need to know when reading it:
 
 - `basic_vars[row]` — which variable is basic in each row; `basic_var_vals` their values.
@@ -273,8 +289,8 @@ cost of the visit: **is the solver already sitting at this node's parent's optim
 
 - `Err(Infeasible)` → genuinely infeasible node → prune. Correct and cheap.
 - `Err(Unbounded)` → impossible for a bounded node → surfaced as `InternalError`.
-- Any other error, such as a singular LU from numerical degradation → **retry once from
-  the slack basis** (identity, cannot fail to load),
+- Any other error, such as a singular LU that basis repair (§3) could not absorb → **retry
+  once from the slack basis** (identity, cannot fail to load),
   re-solving the node from scratch; a second failure propagates. The retry is per-node-visit
   — it cannot mask a systematic failure.
 - `Ok(Limit)` → the deadline fired mid-solve → the node is pushed back **unsolved** and the
@@ -541,7 +557,7 @@ magnitude, but govern distinct layers and must not be conflated.
 | Root LP unbounded on a MILP | run a resumable zero-objective integer-feasibility search; any integer point proves `Unbounded`, exhaustion proves `Infeasible` |
 | Node LP infeasible | prune (correct) |
 | Node LP unbounded | impossible when the node is bounded → `InternalError` |
-| Singular LU or an exactly-integral candidate with guard-breaking drift | retry once from the slack basis; then propagate |
+| Singular LU that survived basis repair, or an exactly-integral candidate with guard-breaking drift | retry once from the slack basis; then propagate |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
 | Phase-1 stall (“no entering column”) | refresh the basis (fresh LU + recomputed values) and retry once per stall; declare `Infeasible` only if it survives the refresh |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |

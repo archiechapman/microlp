@@ -123,6 +123,60 @@ pub fn lu_factorize<'a>(
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> Result<LUFactors, Error> {
+    lu_factorize_impl(size, get_col, stability_coeff, scratch, None)
+}
+
+/// A column of the input matrix that [`lu_factorize_repairing`] replaced by a unit
+/// column because it was numerically dependent on the columns factored before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replacement {
+    /// Index of the dependent input column.
+    pub col: usize,
+    /// Row `r` of the unit column `e_r` that took its place.
+    pub row: usize,
+}
+
+/// Like [`lu_factorize`], but a numerically dependent column does not fail the
+/// factorization: it is replaced by the unit column `e_r` of a row `r` that has
+/// no pivot yet and for which `row_available(r)` holds, and the replacement is
+/// reported. The factors are those of the repaired matrix. This is the standard
+/// simplex basis repair: `e_r` is the column of row `r`'s slack variable, so the
+/// caller swaps that slack into the basis in place of the dependent column.
+///
+/// `row_available` must reject rows whose unit column is already part of the
+/// matrix (a basic slack); among the unpivoted rows there is always one it
+/// accepts, because a unit column pivots on its own row.
+pub fn lu_factorize_repairing<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    row_available: &dyn Fn(usize) -> bool,
+) -> Result<(LUFactors, Vec<Replacement>), Error> {
+    let mut replaced = Vec::new();
+    let lu = lu_factorize_impl(
+        size,
+        get_col,
+        stability_coeff,
+        scratch,
+        Some((row_available, &mut replaced)),
+    )?;
+    Ok((lu, replaced))
+}
+
+/// The repair hook of [`lu_factorize_impl`]: the `row_available` predicate of
+/// [`lu_factorize_repairing`], paired with the log the substitutions it makes
+/// are reported through. `None` factorizes strictly, failing on a dependent
+/// column.
+type RepairHook<'a> = (&'a dyn Fn(usize) -> bool, &'a mut Vec<Replacement>);
+
+fn lu_factorize_impl<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    mut repair: Option<RepairHook<'_>>,
+) -> Result<LUFactors, Error> {
     // Implementation of the Gilbert-Peierls algorithm:
     //
     // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
@@ -194,7 +248,7 @@ pub fn lu_factorize<'a>(
         // but bad for sparseness, so we do threshold pivoting instead.
 
         let pivot_orig_r = {
-            let mut max_abs = 0.0;
+            let mut max_abs: f64 = 0.0;
             for &orig_r in &scratch.rhs.nonzero {
                 if orig2new_row[orig_r] < i_col {
                     continue;
@@ -207,7 +261,23 @@ pub fn lu_factorize<'a>(
             }
 
             if max_abs < EPS {
-                return Err(Error::SingularMatrix);
+                let Some((row_available, replaced)) = repair.as_mut() else {
+                    return Err(Error::SingularMatrix);
+                };
+                let pos = col_perm.new2orig[i_col];
+                // Substitute the unit column of an unpivoted, available row. Its
+                // forward solve is the unit vector itself (no pivoted row touches
+                // it), so it pivots on that row with value 1.
+                let Some(row) = (0..size)
+                    .filter(|&r| orig2new_row[r] >= i_col && row_available(r))
+                    .min_by_key(|&r| orig_row2elt_count[r])
+                else {
+                    return Err(Error::SingularMatrix);
+                };
+                replaced.push(Replacement { col: pos, row });
+                scratch.rhs.clear();
+                *scratch.rhs.get_mut(row) = 1.0;
+                max_abs = 1.0;
             }
 
             assert!(max_abs.is_normal());
@@ -611,6 +681,70 @@ mod tests {
                 &mut scratch,
             );
             assert_eq!(err.unwrap_err(), Error::SingularMatrix);
+        }
+    }
+
+    /// The same two singular matrices as `lu_singular`, but factored with a
+    /// repair hook: a dependent column is replaced by the unit column of a row
+    /// that has no pivot yet, the substitution is reported, and the factors
+    /// returned are those of the repaired matrix (so they invert it).
+    #[test]
+    fn lu_repairing() {
+        init();
+        let size = 3;
+
+        let symbolically_singular: &[(usize, usize, f64)] =
+            &[(0, 0, 1.0), (1, 0, 1.0), (1, 1, 2.0), (1, 2, 3.0)];
+        let numerically_singular: &[(usize, usize, f64)] = &[
+            (0, 0, 1.0),
+            (1, 0, 1.0),
+            (1, 1, 2.0),
+            (1, 2, 3.0),
+            (2, 0, 2.0),
+            (2, 1, 2.0),
+            (2, 2, 3.0),
+        ];
+
+        for triplets in [symbolically_singular, numerically_singular] {
+            let mat = mat_from_triplets(size, size, triplets);
+
+            let mut scratch = ScratchSpace::with_capacity(size);
+            let (lu, replaced) = lu_factorize_repairing(
+                size,
+                |c| mat.outer_view(c).unwrap().into_raw_storage(),
+                0.9,
+                &mut scratch,
+                &|_| true,
+            )
+            .expect("a repairing factorization must not fail on a singular matrix");
+
+            // Both matrices have rank 2: exactly one column is dependent.
+            assert_eq!(replaced.len(), 1);
+            let Replacement { col, row } = replaced[0];
+
+            // Rebuild the matrix the repair actually factored: `col` swapped
+            // for the unit column of `row`.
+            let repaired = {
+                let mut kept = triplets
+                    .iter()
+                    .copied()
+                    .filter(|(_, c, _)| *c != col)
+                    .collect::<Vec<_>>();
+                kept.push((row, col, 1.0));
+                mat_from_triplets(size, size, &kept)
+            };
+
+            // Solving with the factors and multiplying back by the repaired
+            // matrix must return the right-hand side.
+            let sparse_rhs = to_sparse(&[1.0, -2.0, 3.0]);
+            let mut rhs = ScatteredVec::empty(size);
+            rhs.set(sparse_rhs.iter());
+            lu.solve(&mut rhs, &mut scratch);
+            let diff = &sparse_rhs - &(&repaired * &rhs.to_csvec());
+            assert!(
+                diff.norm(1.0) < 1e-5,
+                "the factors do not invert the repaired matrix"
+            );
         }
     }
 
