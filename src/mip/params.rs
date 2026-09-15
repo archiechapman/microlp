@@ -51,3 +51,19 @@ pub(crate) const GAP_DENOM_GUARD: f64 = 1e-10;
 /// this constant only forgives noise in the hint value itself, never a real
 /// out-of-bounds input.
 pub(crate) const HINT_BOUNDS_SLACK: f64 = 1e-9;
+
+/// Most Gomory cuts added per root round (the most fractional rows first): one per
+/// `GOMORY_ROWS_PER_CUT_ROUND` model rows, clamped to `[GOMORY_MIN_CUTS_PER_ROUND,
+/// GOMORY_MAX_CUTS_PER_ROUND]`. Every cut is a new row in every later node LP, so the
+/// budget scales with the model instead of taking one cut per fractional row.
+pub(crate) const GOMORY_MAX_CUTS_PER_ROUND: usize = 100;
+pub(crate) const GOMORY_MIN_CUTS_PER_ROUND: usize = 10;
+pub(crate) const GOMORY_ROWS_PER_CUT_ROUND: usize = 10;
+
+/// All root rounds together add at most one cut per this many model rows (at least
+/// `GOMORY_MIN_CUTS_PER_ROUND`).
+pub(crate) const GOMORY_ROWS_PER_CUT_TOTAL: usize = 2;
+
+/// A root cut round "stalls" when it improves the bound by less than this fraction of
+/// `max(1, |bound|)`; two stalled rounds in a row end the loop.
+pub(crate) const GOMORY_STALL_REL: f64 = 1e-5;

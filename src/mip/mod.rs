@@ -68,6 +68,12 @@ pub struct SolveOptions {
     /// field only once you understand the correctness/permissiveness
     /// trade-off documented on it.
     pub tolerances: Tolerances,
+    /// Rounds of Gomory mixed-integer cuts at the root of a MILP search. Each round
+    /// derives cuts from the fractional rows of the optimal root tableau, adds them as
+    /// rows and re-solves; the loop also stops when no cut is found or the bound stalls.
+    /// Cuts tighten the relaxation (fewer nodes) at the cost of larger node LPs.
+    /// Default `0` (no cuts).
+    pub gomory_rounds: u32,
 }
 
 impl Default for SolveOptions {
@@ -79,6 +85,7 @@ impl Default for SolveOptions {
             int_tol: 1e-6,
             warm_start: None,
             tolerances: Tolerances::default(),
+            gomory_rounds: 0,
         }
     }
 }
@@ -206,6 +213,11 @@ pub struct Stats {
     /// Relative gap between incumbent and best bound. `None` until both are
     /// known; `Some(0.0)` once optimality is proven.
     pub gap: Option<f64>,
+    /// Cutting planes added at the root (see [`SolveOptions::gomory_rounds`]).
+    pub root_cuts: u64,
+    /// Root relaxation bound before any cuts, in user space (`None` for a pure LP or
+    /// before the root is solved).
+    pub root_lp_bound: Option<f64>,
 }
 
 /// A feasible integer assignment, in internal (minimize) objective space.
@@ -827,7 +839,7 @@ fn enumerate_candidate(
                 .map_err(|error| Error::InvalidOperation(error.2.to_string()))?;
             prepared.push((coeffs, op, rhs));
         }
-        let added = state.solver.append_rows(prepared)?;
+        let added = state.solver.append_rows(prepared, false)?;
         state.enumeration.as_mut().expect("enumeration run").lazy_rows += added;
         if state.solver.check_constraints(&values, feasibility) {
             return Err(Error::InvalidOperation(
@@ -1205,6 +1217,83 @@ fn try_warm_start(
     Ok(None)
 }
 
+/// Root cutting-plane loop: up to `options.gomory_rounds` rounds of Gomory mixed-integer
+/// cuts ([`Solver::gomory_cuts`]), each added as rows and re-optimised. Stops early when
+/// the root point is integral, no cut is found, or the bound stalls. The cuts are derived
+/// at the root bounds, so they are globally valid and stay in the solver for the whole
+/// search (they are not part of `base`, and candidate validation ignores them).
+///
+/// Returns `Limit` if the deadline interrupted a re-solve.
+///
+/// If a round makes the relaxation infeasible, all cuts are discarded (the solver is
+/// rebuilt from the model and the root re-solved). Valid cuts can only do that when no
+/// integer point exists, which the search then proves without them; but with the
+/// engine's tight tolerances it can also be round-off, and an unverified `Infeasible`
+/// must never stand as a proof.
+fn root_cuts(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReason, Error> {
+    match root_cut_rounds(state, domains) {
+        Err(Error::Infeasible) => {
+            debug!("root cuts made the relaxation infeasible; discarding them");
+            let lp_iterations = state.solver.lp_iterations;
+            let problem = effective_problem(&state.base, &state.fixed);
+            state.solver = problem.build_solver(state.deadline)?;
+            state.solver.lp_iterations = lp_iterations;
+            state.stats.root_cuts = 0;
+            state.solver.initial_solve()
+        }
+        result => result,
+    }
+}
+
+fn root_cut_rounds(state: &mut MipState, domains: &[VarDomain]) -> Result<StopReason, Error> {
+    let int_tol = state.options.int_tol;
+    let rows = state.solver.num_constraints();
+    let per_round = (rows / params::GOMORY_ROWS_PER_CUT_ROUND).clamp(
+        params::GOMORY_MIN_CUTS_PER_ROUND,
+        params::GOMORY_MAX_CUTS_PER_ROUND,
+    );
+    let mut budget = (rows / params::GOMORY_ROWS_PER_CUT_TOTAL)
+        .max(params::GOMORY_MIN_CUTS_PER_ROUND);
+    let mut stalled = 0;
+    for round in 0..state.options.gomory_rounds {
+        if budget == 0 || branching::is_integral(&state.solver, domains, int_tol) {
+            break;
+        }
+        let before = state.solver.cur_obj_val;
+        let cuts = state.solver.gomory_cuts(per_round.min(budget));
+        if cuts.is_empty() {
+            break;
+        }
+        budget -= cuts.len();
+        let rows = cuts
+            .into_iter()
+            .map(|(coeffs, rhs)| (coeffs, ComparisonOp::Ge, rhs))
+            .collect();
+        let added = state.solver.append_rows(rows, true)?;
+        state.stats.root_cuts += added as u64;
+        if state.solver.reoptimize()? == StopReason::Limit {
+            return Ok(StopReason::Limit);
+        }
+        let gain = state.solver.cur_obj_val - before;
+        debug!(
+            "root cut round {}: {} cuts, bound {:.6} (+{:.3e})",
+            round + 1,
+            added,
+            state.solver.cur_obj_val,
+            gain
+        );
+        if gain <= params::GOMORY_STALL_REL * before.abs().max(1.0) {
+            stalled += 1;
+            if stalled >= 2 {
+                break;
+            }
+        } else {
+            stalled = 0;
+        }
+    }
+    Ok(StopReason::Finished)
+}
+
 /// Solve or resume the root relaxation, restore any advisory warm start, and
 /// either close the problem or seed the open tree. `None` means node processing
 /// can begin; `Some` is a completed or interrupted root outcome.
@@ -1225,6 +1314,19 @@ fn initialize_root(
     if let Some(hints) = state.options.warm_start.take() {
         if let Some(outcome) = try_warm_start(state, &hints)? {
             return Ok(Some(outcome));
+        }
+    }
+
+    state.stats.root_lp_bound = Some(to_user_space(state.direction, state.solver.cur_obj_val));
+    if state.options.gomory_rounds > 0 && !state.classifying_unbounded {
+        match root_cuts(state, domains)? {
+            StopReason::Finished => {}
+            StopReason::Limit => {
+                // The re-solve after a round was interrupted: no usable root optimum.
+                // A resume re-enters `initial_solve` and runs the cut loop again.
+                state.root_solved = false;
+                return Ok(Some(TerminationReason::TimeLimit));
+            }
         }
     }
 
