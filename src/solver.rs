@@ -2,7 +2,7 @@ use core::time::Duration;
 
 use crate::{
     helpers::{resized_view, to_dense},
-    lu::{lu_factorize, LUFactors, ScratchSpace},
+    lu::{lu_factorize, lu_factorize_repairing, LUFactors, Replacement, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
     ComparisonOp, CsVec, Error, StopReason, VarDomain,
 };
@@ -47,6 +47,20 @@ pub(crate) const DEADLINE_CHECK_INTERVAL: u64 = 1000;
 /// at the cost of extra fill-in) against sparsity (lower risks amplifying
 /// rounding error through a poorly-conditioned pivot).
 pub(crate) const LU_STABILITY_THRESHOLD: f64 = 0.1;
+
+/// Smallest tableau element the dual ratio test prefers as a pivot. Entries below
+/// it are typically cancellation noise on a coefficient that is zero in exact
+/// arithmetic; pivoting on one (anything above [`EPS`] used to qualify) makes the
+/// basis numerically singular, and the next refactorization fails with
+/// `SingularMatrix`. The ratio test falls back to a tiny pivot only when no
+/// candidate of at least this size exists. 1e-7 is the usual production value
+/// (CLP, HiGHS).
+pub(crate) const PIVOT_TOL: f64 = 1e-7;
+
+/// Bound on dual/primal simplex alternations in one re-solve (see `settle_phases`).
+/// Each extra round is triggered by a basis repair, which is rare; hitting the bound
+/// means repairs keep undoing progress and is reported as an internal error.
+const MAX_PHASE_ROUNDS: usize = 20;
 
 /// A variable bound whose magnitude is at least this large is treated as
 /// infinite when choosing a non-basic variable's INITIAL value (see
@@ -251,6 +265,10 @@ pub(crate) struct Solver {
     sq_norms_update_helper: Vec<f64>,
     inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
+
+    /// Raised by [`Self::refactor_repairing`] when a singular refactorization changed the
+    /// basis; a simplex phase consumes it to decide whether it can continue.
+    basis_repaired: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -539,6 +557,7 @@ impl Solver {
             sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
+            basis_repaired: false,
         };
 
         debug!(
@@ -673,20 +692,30 @@ impl Solver {
     /// feasibility, then primal simplex if reduced costs became dual-infeasible
     /// (only happens after loosening bounds or a numerically imperfect basis load).
     pub(crate) fn reoptimize(&mut self) -> Result<StopReason, Error> {
-        if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
-            return Ok(StopReason::Limit);
-        }
-        if !self.is_dual_feasible {
-            self.recalc_obj_coeffs()?;
-            if self.optimize()? == StopReason::Limit {
-                return Ok(StopReason::Limit);
-            }
-            // Primal simplex may have moved through vertices; make sure primal holds too.
+        self.settle_phases()
+    }
+
+    /// Alternate dual simplex (primal feasibility) and primal simplex (dual feasibility)
+    /// until both hold. Normally one round; another is needed only when a basis repair
+    /// inside a phase broke the feasibility that phase relied on.
+    fn settle_phases(&mut self) -> Result<StopReason, Error> {
+        for _ in 0..MAX_PHASE_ROUNDS {
             if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
                 return Ok(StopReason::Limit);
             }
+            if !self.is_dual_feasible {
+                self.recalc_obj_coeffs()?;
+                if self.optimize()? == StopReason::Limit {
+                    return Ok(StopReason::Limit);
+                }
+            }
+            if self.is_primal_feasible && self.is_dual_feasible {
+                return Ok(StopReason::Finished);
+            }
         }
-        Ok(StopReason::Finished)
+        Err(Error::InternalError(
+            "simplex phases did not settle after repeated basis repairs".to_string(),
+        ))
     }
 
     pub(crate) fn snapshot_basis(&self) -> Basis {
@@ -840,7 +869,11 @@ impl Solver {
             VarState::Basic(row) => {
                 // if var was basic, remove it.
                 self.calc_row_coeffs(row);
-                let pivot_info = self.choose_entering_col_dual(row, val)?;
+                let (pivot_info, skipped_tiny) = self.choose_entering_col_dual(row, val)?;
+                if skipped_tiny {
+                    // settle_phases below repairs this before returning.
+                    self.is_dual_feasible = false;
+                }
                 self.calc_col_coeffs(pivot_info.col);
                 self.pivot(&pivot_info)?;
                 pivot_info.col
@@ -867,7 +900,7 @@ impl Solver {
         self.nb_var_is_fixed[col] = true;
 
         self.is_primal_feasible = false;
-        self.restore_feasibility()
+        self.settle_phases()
     }
 
     /// Return whether the var was really unset and whether reoptimization
@@ -905,15 +938,8 @@ impl Solver {
             return Ok(StopReason::Limit);
         }
 
-        if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
+        if self.settle_phases()? == StopReason::Limit {
             return Ok(StopReason::Limit);
-        }
-
-        if !self.is_dual_feasible {
-            self.recalc_obj_coeffs()?;
-            if self.optimize()? == StopReason::Limit {
-                return Ok(StopReason::Limit);
-            }
         }
 
         // Disable updates of primal sq. norms, because lengthy primal simplex runs
@@ -940,6 +966,11 @@ impl Solver {
 
             if let Some(pivot_info) = self.choose_pivot()? {
                 self.pivot(&pivot_info)?;
+                if std::mem::take(&mut self.basis_repaired) && !self.is_primal_feasible {
+                    // Primal simplex needs a primal-feasible basis; hand back to the
+                    // caller's phase loop (the dual flag was set honestly by the repair).
+                    return Ok(StopReason::Finished);
+                }
             } else {
                 debug!(
                     "found optimum in {} iterations, obj.: {}",
@@ -966,6 +997,12 @@ impl Solver {
         // the basic values recomputed from the original data. See below.
         let mut refreshed_since_pivot = false;
 
+        // A dual-feasible entry can lose dual feasibility here when the ratio test
+        // passes over a tiny pivot (see `PIVOT_TOL`) or a basis repair happens. The
+        // flag is cleared at that moment and re-checked at the end; callers go through
+        // `settle_phases`, which runs primal simplex when it stays cleared.
+        let was_dual_feasible = self.is_dual_feasible;
+
         for iter in 0.. {
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
@@ -983,7 +1020,16 @@ impl Solver {
             if let Some((row, leaving_new_val)) = self.choose_pivot_row_dual() {
                 self.calc_row_coeffs(row);
                 let pivot_info = match self.choose_entering_col_dual(row, leaving_new_val) {
-                    Ok(pivot_info) => pivot_info,
+                    Ok((pivot_info, skipped_tiny)) => {
+                        if skipped_tiny {
+                            debug!(
+                                "restore feasibility iter {}: passed over a pivot below PIVOT_TOL in row {}",
+                                iter, row,
+                            );
+                            self.is_dual_feasible = false;
+                        }
+                        pivot_info
+                    }
                     Err(Error::Infeasible) if !refreshed_since_pivot => {
                         // "No eligible entering column" is a proof of primal
                         // infeasibility only in exact arithmetic. This deep
@@ -1002,9 +1048,13 @@ impl Solver {
                              refreshing basis before declaring infeasibility",
                             iter, row,
                         );
-                        self.basis_solver
-                            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-                        self.recalc_basic_var_vals()?;
+                        if self.refactor_repairing()? {
+                            // A repair recomputed everything; the dual flag it set is
+                            // handled at the end of this phase.
+                            self.basis_repaired = false;
+                        } else {
+                            self.recalc_basic_var_vals()?;
+                        }
                         refreshed_since_pivot = true;
                         continue;
                     }
@@ -1012,6 +1062,8 @@ impl Solver {
                 };
                 self.calc_col_coeffs(pivot_info.col);
                 self.pivot(&pivot_info)?;
+                // Dual simplex tolerates a repaired basis: it only needs a basis.
+                self.basis_repaired = false;
                 // Any successful pivot is progress: re-arm the valve.
                 refreshed_since_pivot = false;
             } else {
@@ -1026,6 +1078,10 @@ impl Solver {
         }
 
         self.is_primal_feasible = true;
+        if was_dual_feasible && !self.is_dual_feasible {
+            // Leave the flag honest; `settle_phases` runs primal simplex if needed.
+            self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+        }
         Ok(StopReason::Finished)
     }
 
@@ -1106,7 +1162,7 @@ impl Solver {
         }
 
         self.is_primal_feasible = false;
-        self.restore_feasibility()
+        self.settle_phases()
     }
 
     /// Number of infeasible basic vars and sum of their infeasibilities.
@@ -1394,11 +1450,14 @@ impl Solver {
         })
     }
 
+    /// Dual ratio test for the leaving `row`. The flag is true when a numerically tiny
+    /// candidate was passed over (see [`PIVOT_TOL`]), which may leave the reduced costs
+    /// of the skipped columns slightly dual infeasible.
     fn choose_entering_col_dual(
         &self,
         row: usize,
         leaving_new_val: f64,
-    ) -> Result<PivotInfo, Error> {
+    ) -> Result<(PivotInfo, bool), Error> {
         // True if the new obj. coeff. must be nonnegative in a dual-feasible configuration.
         let leaving_diff_sign = leaving_new_val > self.basic_var_vals[row];
 
@@ -1434,56 +1493,74 @@ impl Solver {
         // Mathematical Programming, 45(1-3), 437-474.
         //
         // https://link.springer.com/content/pdf/10.1007/BF01589114.pdf
+        //
+        // Candidates are restricted to |coeff| >= min_abs.
+        let select = |min_abs: f64| -> Option<(usize, f64)> {
+            // First, we determine the max step (change in the leaving variable obj. coeff that
+            // still leaves us with a dual-feasible state) using relaxed bounds.
+            let mut max_step = f64::INFINITY;
+            for (c, &coeff) in self.row_coeffs.iter() {
+                let var_state = &self.nb_var_states[c];
+                if coeff.abs() < min_abs || !is_eligible_var(coeff, var_state) {
+                    continue;
+                }
 
-        // First, we determine the max step (change in the leaving variable obj. coeff that still
-        // leaves us with a dual-feasible state) using relaxed bounds.
-        let mut max_step = f64::INFINITY;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            let var_state = &self.nb_var_states[c];
-            if !is_eligible_var(coeff, var_state) {
-                continue;
-            }
-
-            let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
-            let cur_step = (obj_coeff.abs() + EPS) / coeff.abs();
-            if cur_step < max_step {
-                max_step = cur_step;
-            }
-        }
-
-        // Second, we choose among the variables satisfying the relaxed step bound
-        // the one with the biggest pivot coefficient. This allows for a much more
-        // numerically stable basis at the price of slight infeasibility in dual variables.
-        let mut entering_c = None;
-        let mut pivot_coeff_abs = f64::NEG_INFINITY;
-        let mut pivot_coeff = 0.0;
-        for (c, &coeff) in self.row_coeffs.iter() {
-            let var_state = &self.nb_var_states[c];
-            if !is_eligible_var(coeff, var_state) {
-                continue;
-            }
-
-            let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
-
-            // If we change obj. coeff of the leaving variable by this amount,
-            // obj. coeff if the current variable will reach the bound of dual infeasibility.
-            // Variable with the tightest such bound is the entering variable.
-            let cur_step = obj_coeff.abs() / coeff.abs();
-            if cur_step <= max_step {
-                let coeff_abs = coeff.abs();
-                if coeff_abs > pivot_coeff_abs {
-                    entering_c = Some(c);
-                    pivot_coeff_abs = coeff_abs;
-                    pivot_coeff = coeff;
+                let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
+                let cur_step = (obj_coeff.abs() + EPS) / coeff.abs();
+                if cur_step < max_step {
+                    max_step = cur_step;
                 }
             }
-        }
 
-        if let Some(col) = entering_c {
-            let entering_diff = (self.basic_var_vals[row] - leaving_new_val) / pivot_coeff;
-            let entering_new_val = self.nb_var_vals[col] + entering_diff;
+            // Second, we choose among the variables satisfying the relaxed step bound
+            // the one with the biggest pivot coefficient. This allows for a much more
+            // numerically stable basis at the price of slight infeasibility in dual variables.
+            let mut entering_c = None;
+            let mut pivot_coeff_abs = f64::NEG_INFINITY;
+            let mut pivot_coeff = 0.0;
+            for (c, &coeff) in self.row_coeffs.iter() {
+                let var_state = &self.nb_var_states[c];
+                if coeff.abs() < min_abs || !is_eligible_var(coeff, var_state) {
+                    continue;
+                }
 
-            Ok(PivotInfo {
+                let obj_coeff = clamp_obj_coeff(self.nb_var_obj_coeffs[c], var_state);
+
+                // If we change obj. coeff of the leaving variable by this amount,
+                // obj. coeff if the current variable will reach the bound of dual infeasibility.
+                // Variable with the tightest such bound is the entering variable.
+                let cur_step = obj_coeff.abs() / coeff.abs();
+                if cur_step <= max_step {
+                    let coeff_abs = coeff.abs();
+                    if coeff_abs > pivot_coeff_abs {
+                        entering_c = Some(c);
+                        pivot_coeff_abs = coeff_abs;
+                        pivot_coeff = coeff;
+                    }
+                }
+            }
+            entering_c.map(|c| (c, pivot_coeff))
+        };
+
+        // A pivot below PIVOT_TOL is usually cancellation noise on an entry that is zero in
+        // exact arithmetic, and entering on it makes the basis numerically singular. Redo the
+        // ratio test without such candidates; the skipped columns may pick up a small dual
+        // infeasibility, which `restore_feasibility` repairs before returning. Only when no
+        // sizeable candidate exists at all is the tiny pivot taken, as before.
+        let (col, pivot_coeff, skipped_tiny) = match select(EPS) {
+            None => return Err(Error::Infeasible),
+            Some((c, coeff)) if coeff.abs() < PIVOT_TOL => match select(PIVOT_TOL) {
+                Some((c2, coeff2)) => (c2, coeff2, true),
+                None => (c, coeff, false),
+            },
+            Some((c, coeff)) => (c, coeff, false),
+        };
+
+        let entering_diff = (self.basic_var_vals[row] - leaving_new_val) / pivot_coeff;
+        let entering_new_val = self.nb_var_vals[col] + entering_diff;
+
+        Ok((
+            PivotInfo {
                 col,
                 entering_new_val,
                 entering_diff,
@@ -1492,10 +1569,9 @@ impl Solver {
                     leaving_new_val,
                     coeff: pivot_coeff,
                 }),
-            })
-        } else {
-            Err(Error::Infeasible)
-        }
+            },
+            skipped_tiny,
+        ))
     }
 
     fn pivot(&mut self, pivot_info: &PivotInfo) -> Result<(), Error> {
@@ -1584,10 +1660,86 @@ impl Solver {
             self.basis_solver
                 .push_eta_matrix(&self.col_coeffs, pivot_elem.row, pivot_coeff);
         } else {
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+            // A repaired basis raises `basis_repaired` for the running phase.
+            self.refactor_repairing()?;
         }
         Ok(())
+    }
+
+    /// Refactorize the current basis. If it has become numerically singular, repair it
+    /// instead of failing: each dependent basic column is swapped for the slack of a row
+    /// the factorization could not cover (a unit column), and the evicted variable becomes
+    /// non-basic at its nearest finite bound (free variables keep their value).
+    ///
+    /// Returns whether the basis changed. When it did, basic values and reduced costs are
+    /// recomputed, steepest-edge weights are reset, and both feasibility flags are set
+    /// honestly; `basis_repaired` is raised so a running simplex phase can react.
+    fn refactor_repairing(&mut self) -> Result<bool, Error> {
+        let num_vars = self.num_vars;
+        let var_states = &self.var_states;
+        let replaced = self.basis_solver.reset_repairing(
+            &self.orig_constraints_csc,
+            &self.basic_vars,
+            &|row| !matches!(var_states[num_vars + row], VarState::Basic(_)),
+        )?;
+        if replaced.is_empty() {
+            return Ok(false);
+        }
+
+        for &Replacement { col: pos, row } in &replaced {
+            let slack = num_vars + row;
+            let VarState::NonBasic(nb_idx) = self.var_states[slack] else {
+                unreachable!("repair row {row} has a basic slack");
+            };
+            let evicted = self.basic_vars[pos];
+            let (min, max) = (self.orig_var_mins[evicted], self.orig_var_maxs[evicted]);
+            let cur = self.basic_var_vals[pos];
+            let val = match (min.is_finite(), max.is_finite()) {
+                (true, true) => {
+                    if (cur - min).abs() <= (max - cur).abs() {
+                        min
+                    } else {
+                        max
+                    }
+                }
+                (true, false) => min,
+                (false, true) => max,
+                (false, false) => cur,
+            };
+
+            self.basic_vars[pos] = slack;
+            self.var_states[slack] = VarState::Basic(pos);
+            self.basic_var_mins[pos] = self.orig_var_mins[slack];
+            self.basic_var_maxs[pos] = self.orig_var_maxs[slack];
+
+            self.nb_vars[nb_idx] = evicted;
+            self.var_states[evicted] = VarState::NonBasic(nb_idx);
+            self.nb_var_vals[nb_idx] = val;
+            self.nb_var_states[nb_idx] = NonBasicVarState {
+                at_min: float_eq(val, min),
+                at_max: float_eq(val, max),
+            };
+            self.nb_var_is_fixed[nb_idx] = false;
+            if self.enable_primal_steepest_edge {
+                self.primal_edge_sq_norms[nb_idx] = 1.0;
+            }
+        }
+        debug!(
+            "basis repair: {} dependent column(s) swapped for slacks",
+            replaced.len()
+        );
+
+        // The factors were built with unit columns in the repaired positions, which are
+        // exactly the slack columns now basic there.
+        if self.enable_dual_steepest_edge {
+            self.dual_edge_sq_norms = vec![1.0; self.basic_vars.len()];
+        }
+        self.recalc_basic_var_vals()?;
+        self.recalc_obj_coeffs()?;
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+        self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+        self.basis_repaired = true;
+        Ok(true)
     }
 
     fn update_primal_sq_norms(&mut self, entering_col: usize, pivot_coeff: f64) {
@@ -1764,6 +1916,35 @@ impl BasisSolver {
             (r, val)
         });
         self.eta_matrices.push(r_leaving, coeffs);
+    }
+
+    /// [`Self::reset`] with basis repair: see [`lu_factorize_repairing`]. `row_available`
+    /// must hold exactly for rows whose slack is non-basic.
+    fn reset_repairing(
+        &mut self,
+        orig_constraints_csc: &CsMat,
+        basic_vars: &[usize],
+        row_available: &dyn Fn(usize) -> bool,
+    ) -> Result<Vec<Replacement>, Error> {
+        self.scratch.clear_sparse(basic_vars.len());
+        self.eta_matrices.clear_and_resize(basic_vars.len());
+        self.rhs.clear_and_resize(basic_vars.len());
+        let (lu_factors, replaced) = lu_factorize_repairing(
+            basic_vars.len(),
+            |c| {
+                orig_constraints_csc
+                    .outer_view(basic_vars[c])
+                    //guaranteed to be a valid index
+                    .unwrap()
+                    .into_raw_storage()
+            },
+            LU_STABILITY_THRESHOLD,
+            &mut self.scratch,
+            row_available,
+        )?;
+        self.lu_factors = lu_factors;
+        self.lu_factors_transp = self.lu_factors.transpose();
+        Ok(replaced)
     }
 
     fn reset(&mut self, orig_constraints_csc: &CsMat, basic_vars: &[usize]) -> Result<(), Error> {
