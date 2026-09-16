@@ -300,6 +300,11 @@ pub(crate) struct Solver {
     /// [`StopReason::Limit`], for probe solves that must stay cheap (strong branching).
     /// `None` = no cap. See [`Self::set_iteration_limit`].
     iteration_limit: Option<u64>,
+    /// Objective value (internal space) beyond which the dual simplex may stop early,
+    /// see [`Self::set_objective_cutoff`].
+    objective_cutoff: Option<f64>,
+    /// Set when a solve stopped because of [`Self::objective_cutoff`].
+    cutoff_reached: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -604,6 +609,8 @@ impl Solver {
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
             basis_repaired: false,
             iteration_limit: None,
+            objective_cutoff: None,
+            cutoff_reached: false,
         };
 
         debug!(
@@ -751,6 +758,11 @@ impl Solver {
         for _ in 0..MAX_PHASE_ROUNDS {
             if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
                 return Ok(StopReason::Limit);
+            }
+            if self.cutoff_reached {
+                // The bound already passed the cutoff; the caller prunes, so finishing
+                // the solve would be wasted work.
+                return Ok(StopReason::Finished);
             }
             if !self.is_dual_feasible {
                 self.recalc_obj_coeffs()?;
@@ -1011,6 +1023,33 @@ impl Solver {
             .is_some_and(|limit| self.lp_iterations >= limit)
     }
 
+    /// Stop the dual simplex as soon as the objective passes `cutoff` (internal space),
+    /// instead of solving on to the optimum. Dual simplex keeps the basis dual feasible
+    /// and raises the objective monotonically, so its running value is already a lower
+    /// bound on this LP's optimum: once it exceeds a cutoff, so does the optimum, and a
+    /// branch & bound caller can prune without paying for the rest of the solve. The
+    /// solve then reports `Finished` with [`Self::cutoff_reached`] set and a coherent but
+    /// non-optimal state, so the caller must not read its objective as the LP value.
+    ///
+    /// Clears the flag; `None` disables the cutoff.
+    pub(crate) fn set_objective_cutoff(&mut self, cutoff: Option<f64>) {
+        self.objective_cutoff = cutoff;
+        self.cutoff_reached = false;
+    }
+
+    /// Whether the last solve stopped at [`Self::set_objective_cutoff`].
+    pub(crate) fn cutoff_reached(&self) -> bool {
+        self.cutoff_reached
+    }
+
+    /// The objective can only be read as a bound while the basis is dual feasible.
+    fn past_cutoff(&self) -> bool {
+        self.is_dual_feasible
+            && self
+                .objective_cutoff
+                .is_some_and(|cutoff| self.cur_obj_val > cutoff)
+    }
+
     fn optimize(&mut self) -> Result<StopReason, Error> {
         for iter in 0.. {
             if self.iterations_exhausted() {
@@ -1134,6 +1173,14 @@ impl Solver {
                 self.basis_repaired = false;
                 // Any successful pivot is progress: re-arm the valve.
                 refreshed_since_pivot = false;
+                if self.past_cutoff() {
+                    debug!(
+                        "restore feasibility iter {}: objective {} passed the cutoff; stopping",
+                        iter, self.cur_obj_val
+                    );
+                    self.cutoff_reached = true;
+                    return Ok(StopReason::Finished);
+                }
             } else {
                 debug!(
                     "restored feasibility in {} iterations, {}: {}",
