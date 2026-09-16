@@ -8,6 +8,7 @@ use crate::{
 };
 use sprs::CompressedStorage;
 
+use std::collections::BTreeMap;
 use web_time::Instant;
 
 pub(crate) type Deadline = Option<Instant>;
@@ -70,6 +71,14 @@ pub(crate) const GOMORY_MAX_DYNAMISM: f64 = 1e6;
 pub(crate) const GOMORY_MIN_EFFICACY: f64 = 1e-5;
 /// Each cut's right-hand side is relaxed by this fraction of `max(1, |rhs|)`.
 pub(crate) const GOMORY_RHS_SLACK: f64 = 1e-9;
+
+/// Slack allowed when [`Solver::propagate_bounds`] rounds an integer variable's deduced
+/// bound inward, and when it calls two bounds crossed. Round-off in an activity sum must
+/// not fix a variable a unit too tightly, nor prune a node that is merely degenerate.
+pub(crate) const PROPAGATE_TOL: f64 = 1e-9;
+/// Smallest bound improvement propagation bothers to apply, relative to the bound's own
+/// magnitude. Without it, sweeps could keep shaving float noise off a bound forever.
+pub(crate) const PROPAGATE_MIN_GAIN: f64 = 1e-7;
 
 /// Bound on dual/primal simplex alternations in one re-solve (see `settle_phases`).
 /// Each extra round is triggered by a basis repair, which is rare; hitting the bound
@@ -313,6 +322,19 @@ pub(crate) enum VarStatus {
     AtUpper,
     /// Non-basic free variable (both bounds infinite), pinned at 0.
     Free,
+}
+
+/// Outcome of [`Solver::propagate_bounds`].
+///
+/// `changes` lists every bound propagation actually applied, and is filled in even when
+/// the bounds turn out to be contradictory: those tightenings are already in the solver,
+/// so the caller must record them either way or they leak into the next node.
+#[derive(Clone, Debug)]
+pub(crate) struct Propagation {
+    /// The bounds now in force for every variable propagation moved, `(var, lo, hi)`.
+    pub changes: Vec<(usize, f64, f64)>,
+    /// False when some variable's bounds crossed: nothing here satisfies the rows.
+    pub feasible: bool,
 }
 
 /// A compact simplex basis: one status per total var (structural + slack).
@@ -1233,6 +1255,163 @@ impl Solver {
 
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         Ok(added)
+    }
+
+    /// Tighten variable bounds from the rows alone (no LP), at most `max_rounds` sweeps.
+    ///
+    /// For a row `lo_r <= a·x <= hi_r`, the extreme values the other terms can take bound
+    /// each remaining variable: with `a_j > 0`,
+    /// `x_j <= (hi_r - min activity of the rest) / a_j`, and symmetrically for the lower
+    /// bound and for `a_j < 0`. Bounds of integer variables are rounded inward, which is
+    /// what makes repeated sweeps worthwhile: a rounded bound feeds the next one. A row
+    /// with more than one infinite contribution says nothing about the variable in
+    /// question, so those are skipped.
+    ///
+    /// Stops as soon as some variable's bounds cross (`feasible: false`): the node has no
+    /// solution and needs no LP. Tightened bounds are applied to the solver and returned in
+    /// both cases, so the caller can record them on the node whose children inherit them —
+    /// and, on the infeasible path, so the next node knows to reset them.
+    ///
+    /// The deductions round with integrality, so they are valid for integer solutions, not
+    /// for every point of the relaxation — the same contract as a branching bound.
+    pub(crate) fn propagate_bounds(&mut self, max_rounds: u32) -> Result<Propagation, Error> {
+        /// Activity of a row's other terms, or `None` when an infinity makes it unusable.
+        fn residual(total: f64, infinite: usize, term: f64) -> Option<f64> {
+            if term.is_finite() {
+                (infinite == 0).then_some(total - term)
+            } else {
+                (infinite == 1).then_some(total)
+            }
+        }
+        fn terms(a: f64, lo: f64, hi: f64) -> (f64, f64) {
+            if a > 0.0 {
+                (a * lo, a * hi)
+            } else {
+                (a * hi, a * lo)
+            }
+        }
+
+        let n = self.num_vars;
+        let mut tightened: BTreeMap<usize, (f64, f64)> = BTreeMap::new();
+        let collect = |tightened: BTreeMap<usize, (f64, f64)>, feasible: bool| Propagation {
+            changes: tightened
+                .into_iter()
+                .map(|(v, (lo, hi))| (v, lo, hi))
+                .collect(),
+            feasible,
+        };
+        for _ in 0..max_rounds {
+            let mut updates: Vec<(usize, f64, f64)> = Vec::new();
+            for r in 0..self.num_constraints() {
+                let rhs = self.orig_rhs[r];
+                let slack = n + r;
+                let (slack_min, slack_max) = (self.orig_var_mins[slack], self.orig_var_maxs[slack]);
+                // a·x = rhs - s, so the slack's bounds give the row's own range.
+                let row_lo = if slack_max.is_finite() {
+                    rhs - slack_max
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let row_hi = if slack_min.is_finite() {
+                    rhs - slack_min
+                } else {
+                    f64::INFINITY
+                };
+                if !row_lo.is_finite() && !row_hi.is_finite() {
+                    continue;
+                }
+                //guaranteed to be a valid index
+                let row = self.orig_constraints.outer_view(r).unwrap();
+
+                let (mut min_act, mut max_act) = (0.0, 0.0);
+                let (mut min_inf, mut max_inf) = (0usize, 0usize);
+                for (v, &a) in row.iter() {
+                    if v >= n || a == 0.0 {
+                        continue;
+                    }
+                    let (lo_term, hi_term) =
+                        terms(a, self.orig_var_mins[v], self.orig_var_maxs[v]);
+                    if lo_term.is_finite() {
+                        min_act += lo_term;
+                    } else {
+                        min_inf += 1;
+                    }
+                    if hi_term.is_finite() {
+                        max_act += hi_term;
+                    } else {
+                        max_inf += 1;
+                    }
+                }
+
+                for (v, &a) in row.iter() {
+                    if v >= n || a == 0.0 {
+                        continue;
+                    }
+                    let (lo, hi) = (self.orig_var_mins[v], self.orig_var_maxs[v]);
+                    let (lo_term, hi_term) = terms(a, lo, hi);
+                    let (mut new_lo, mut new_hi) = (lo, hi);
+                    if row_hi.is_finite() {
+                        if let Some(rest) = residual(min_act, min_inf, lo_term) {
+                            let bound = (row_hi - rest) / a;
+                            if a > 0.0 {
+                                new_hi = new_hi.min(bound);
+                            } else {
+                                new_lo = new_lo.max(bound);
+                            }
+                        }
+                    }
+                    if row_lo.is_finite() {
+                        if let Some(rest) = residual(max_act, max_inf, hi_term) {
+                            let bound = (row_lo - rest) / a;
+                            if a > 0.0 {
+                                new_lo = new_lo.max(bound);
+                            } else {
+                                new_hi = new_hi.min(bound);
+                            }
+                        }
+                    }
+                    if new_lo.is_nan() || new_hi.is_nan() {
+                        continue;
+                    }
+                    if matches!(
+                        self.orig_var_domains[v],
+                        VarDomain::Integer | VarDomain::Boolean
+                    ) {
+                        if new_lo.is_finite() {
+                            new_lo = (new_lo - PROPAGATE_TOL).ceil();
+                        }
+                        if new_hi.is_finite() {
+                            new_hi = (new_hi + PROPAGATE_TOL).floor();
+                        }
+                    }
+                    if new_lo > new_hi + PROPAGATE_TOL {
+                        return Ok(collect(tightened, false));
+                    }
+                    let gain = |new: f64, old: f64| {
+                        (new - old).abs() > PROPAGATE_MIN_GAIN * old.abs().max(1.0)
+                    };
+                    if (new_lo > lo && gain(new_lo, lo)) || (new_hi < hi && gain(new_hi, hi)) {
+                        updates.push((v, new_lo.max(lo), new_hi.min(hi)));
+                    }
+                }
+            }
+
+            if updates.is_empty() {
+                break;
+            }
+            for (v, lo, hi) in updates {
+                // Another row in the same sweep may have moved this variable already.
+                let lo = lo.max(self.orig_var_mins[v]);
+                let hi = hi.min(self.orig_var_maxs[v]);
+                if lo > hi + PROPAGATE_TOL {
+                    return Ok(collect(tightened, false));
+                }
+                let hi = hi.max(lo);
+                self.set_var_bounds(v, lo, hi)?;
+                tightened.insert(v, (lo, hi));
+            }
+        }
+        Ok(collect(tightened, true))
     }
 
     /// Gomory mixed-integer (GMI) cuts from the current optimal tableau, at most `max_cuts`,

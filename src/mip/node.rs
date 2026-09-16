@@ -27,6 +27,11 @@ pub(crate) struct Node {
     /// Direction and parent fractionality for a variable branch.
     pub branch_up: bool,
     pub branch_frac: f64,
+    /// Propagation has already run here (see [`crate::SolveOptions::propagate_rounds`]).
+    /// A node interrupted before its LP is visited again, and propagation is capped at a
+    /// number of sweeps, so a second pass could deduce more than the first — which would
+    /// make a resumed search explore differently from an uninterrupted one.
+    pub propagated: bool,
 }
 
 /// Collapse a bound-change list to one entry per var (later entries win),

@@ -7,7 +7,7 @@ pub(crate) mod branching;
 pub(crate) mod node;
 pub(crate) mod params;
 
-use crate::solver::{check_deadline, Deadline, Solver};
+use crate::solver::{check_deadline, Deadline, Propagation, Solver};
 use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
 use core::time::Duration;
 use node::{effective_bounds, Node};
@@ -81,6 +81,16 @@ pub struct SolveOptions {
     /// top of the tree and buys better branching decisions there; it stops by itself as
     /// pseudocosts become reliable. Default `0` (pure pseudocost branching).
     pub strong_branch_reliability: u32,
+    /// Bound-propagation sweeps run at the root and at every node before its LP. Each
+    /// sweep deduces tighter variable bounds from the rows alone (no LP), rounding
+    /// integer bounds inward; deduced bounds are inherited by the node's children, and a
+    /// node whose bounds cross is pruned without an LP solve. Cheap relative to an LP,
+    /// but wasted on models where the rows imply nothing. Default `0` (no propagation).
+    ///
+    /// Note: like any change to the search order, this can change *which* of several
+    /// equally optimal solutions is returned, including between an uninterrupted solve
+    /// and the same solve resumed from a node limit. The objective is unaffected.
+    pub propagate_rounds: u32,
 }
 
 impl Default for SolveOptions {
@@ -94,6 +104,7 @@ impl Default for SolveOptions {
             tolerances: Tolerances::default(),
             gomory_rounds: 0,
             strong_branch_reliability: 0,
+            propagate_rounds: 0,
         }
     }
 }
@@ -229,6 +240,11 @@ pub struct Stats {
     /// Child LPs solved for strong branching (see
     /// [`SolveOptions::strong_branch_reliability`]).
     pub strong_branch_lps: u64,
+    /// Variable bounds tightened by propagation (see
+    /// [`SolveOptions::propagate_rounds`]).
+    pub bounds_tightened: u64,
+    /// Nodes propagation proved infeasible before any LP was solved.
+    pub propagation_prunes: u64,
 }
 
 /// A feasible integer assignment, in internal (minimize) objective space.
@@ -947,6 +963,20 @@ fn process_integral_candidate(
     }
 }
 
+/// Store bounds deduced by propagation on `node` (so its children inherit them) and
+/// mirror them in `state.applied`, which is what the next node diffs against.
+fn record_propagated(state: &mut MipState, node: &mut Node, changes: Vec<(usize, f64, f64)>) {
+    state.stats.bounds_tightened += changes.len() as u64;
+    for (var, lo, hi) in changes {
+        // `effective_bounds` keeps the last entry per variable, so pushing is enough.
+        node.bound_changes.push((var, lo, hi));
+        match state.applied.binary_search_by_key(&var, |t| t.0) {
+            Ok(i) => state.applied[i] = (var, lo, hi),
+            Err(i) => state.applied.insert(i, (var, lo, hi)),
+        }
+    }
+}
+
 /// Apply `node`'s bounds to the solver, diffing against what is currently applied.
 /// Returns false (node pruned, solver untouched) if the node's bounds cross.
 fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
@@ -1021,6 +1051,7 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         branch_var: Some(var),
         branch_up: false,
         branch_frac: f_down,
+        propagated: false,
     };
     let up_node = Node {
         bound_changes: up_changes,
@@ -1031,6 +1062,7 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         branch_var: Some(var),
         branch_up: true,
         branch_frac: 1.0 - f_down,
+        propagated: false,
     };
 
     // Estimate-ordered dive: push the child with the LARGER estimated degradation
@@ -1338,6 +1370,28 @@ fn initialize_root(
     }
 
     state.stats.root_lp_bound = Some(to_user_space(state.direction, state.solver.cur_obj_val));
+
+    // Root propagation runs before the cuts, so they are derived from the tighter model.
+    let mut root_bound_changes = Vec::new();
+    if state.options.propagate_rounds > 0 && !state.classifying_unbounded {
+        let propagation = state.solver.propagate_bounds(state.options.propagate_rounds)?;
+        state.stats.bounds_tightened += propagation.changes.len() as u64;
+        for (var, lo, hi) in propagation.changes {
+            root_bound_changes.push((var, lo, hi));
+            match state.applied.binary_search_by_key(&var, |t| t.0) {
+                Ok(i) => state.applied[i] = (var, lo, hi),
+                Err(i) => state.applied.insert(i, (var, lo, hi)),
+            }
+        }
+        if !propagation.feasible {
+            return Err(Error::Infeasible);
+        }
+        if !root_bound_changes.is_empty() && state.solver.reoptimize()? == StopReason::Limit {
+            state.root_solved = false;
+            return Ok(Some(TerminationReason::TimeLimit));
+        }
+    }
+
     if state.options.gomory_rounds > 0 && !state.classifying_unbounded {
         match root_cuts(state, domains)? {
             StopReason::Finished => {}
@@ -1351,7 +1405,7 @@ fn initialize_root(
     }
 
     let root = Node {
-        bound_changes: Vec::new(),
+        bound_changes: root_bound_changes,
         basis: state.solver.snapshot_basis(),
         lp_bound: state.solver.cur_obj_val,
         depth: 0,
@@ -1359,6 +1413,7 @@ fn initialize_root(
         branch_var: None,
         branch_up: false,
         branch_frac: 1.0,
+        propagated: true,
     };
     let int_tol = state.options.int_tol;
     if let Some(cutoff) = enumeration_cutoff(state) {
@@ -1422,6 +1477,22 @@ fn visit_node(
     if !apply_node_bounds(state, &node) {
         state.diving = false;
         return Ok(NodeVisit::Pruned);
+    }
+
+    // Propagation before the LP: deduced bounds go onto the node (its children inherit
+    // them), and a contradiction prunes the node without solving anything.
+    if state.options.propagate_rounds > 0 && !node.propagated {
+        node.propagated = true;
+        let propagation = state.solver.propagate_bounds(state.options.propagate_rounds)?;
+        // Record even when infeasible: those bounds are in the solver already, and
+        // `state.applied` is what tells the next node to reset them.
+        record_propagated(state, &mut node, propagation.changes);
+        if !propagation.feasible {
+            state.stats.propagation_prunes += 1;
+            state.last_solved_id = None;
+            state.diving = false;
+            return Ok(NodeVisit::Pruned);
+        }
     }
 
     let warm = state.last_solved_id == Some(node.parent_id);
