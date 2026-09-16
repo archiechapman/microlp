@@ -963,13 +963,18 @@ fn process_integral_candidate(
     }
 }
 
-/// Store bounds deduced by propagation on `node` (so its children inherit them) and
-/// mirror them in `state.applied`, which is what the next node diffs against.
-fn record_propagated(state: &mut MipState, node: &mut Node, changes: Vec<(usize, f64, f64)>) {
+/// Mirror bounds deduced by propagation in `state.applied`, which is what the next node
+/// diffs against to reset them.
+///
+/// Deliberately NOT stored on the node: a node's `bound_changes` is cumulative and is
+/// cloned into both children at every branch, so recording every deduction would make the
+/// lists grow with depth and exhaust memory on a model with many variables. Children
+/// re-derive what they need by propagating themselves, which also makes a node's
+/// deductions depend only on its own bounds — so re-visiting a node after an interruption
+/// deduces exactly the same thing.
+fn record_propagated(state: &mut MipState, changes: Vec<(usize, f64, f64)>) {
     state.stats.bounds_tightened += changes.len() as u64;
     for (var, lo, hi) in changes {
-        // `effective_bounds` keeps the last entry per variable, so pushing is enough.
-        node.bound_changes.push((var, lo, hi));
         match state.applied.binary_search_by_key(&var, |t| t.0) {
             Ok(i) => state.applied[i] = (var, lo, hi),
             Err(i) => state.applied.insert(i, (var, lo, hi)),
@@ -1051,7 +1056,6 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         branch_var: Some(var),
         branch_up: false,
         branch_frac: f_down,
-        propagated: false,
     };
     let up_node = Node {
         bound_changes: up_changes,
@@ -1062,7 +1066,6 @@ fn branch(state: &mut MipState, parent: &Node, var: usize) {
         branch_var: Some(var),
         branch_up: true,
         branch_frac: 1.0 - f_down,
-        propagated: false,
     };
 
     // Estimate-ordered dive: push the child with the LARGER estimated degradation
@@ -1372,21 +1375,19 @@ fn initialize_root(
     state.stats.root_lp_bound = Some(to_user_space(state.direction, state.solver.cur_obj_val));
 
     // Root propagation runs before the cuts, so they are derived from the tighter model.
-    let mut root_bound_changes = Vec::new();
     if state.options.propagate_rounds > 0 && !state.classifying_unbounded {
         let propagation = state.solver.propagate_bounds(state.options.propagate_rounds)?;
         state.stats.bounds_tightened += propagation.changes.len() as u64;
+        // Deductions at the root hold everywhere, so they become the root bounds every
+        // node resets to — no node has to carry them.
+        let tightened = !propagation.changes.is_empty();
         for (var, lo, hi) in propagation.changes {
-            root_bound_changes.push((var, lo, hi));
-            match state.applied.binary_search_by_key(&var, |t| t.0) {
-                Ok(i) => state.applied[i] = (var, lo, hi),
-                Err(i) => state.applied.insert(i, (var, lo, hi)),
-            }
+            state.root_bounds[var] = (lo, hi);
         }
         if !propagation.feasible {
             return Err(Error::Infeasible);
         }
-        if !root_bound_changes.is_empty() && state.solver.reoptimize()? == StopReason::Limit {
+        if tightened && state.solver.reoptimize()? == StopReason::Limit {
             state.root_solved = false;
             return Ok(Some(TerminationReason::TimeLimit));
         }
@@ -1405,7 +1406,7 @@ fn initialize_root(
     }
 
     let root = Node {
-        bound_changes: root_bound_changes,
+        bound_changes: Vec::new(),
         basis: state.solver.snapshot_basis(),
         lp_bound: state.solver.cur_obj_val,
         depth: 0,
@@ -1413,7 +1414,6 @@ fn initialize_root(
         branch_var: None,
         branch_up: false,
         branch_frac: 1.0,
-        propagated: true,
     };
     let int_tol = state.options.int_tol;
     if let Some(cutoff) = enumeration_cutoff(state) {
@@ -1481,12 +1481,11 @@ fn visit_node(
 
     // Propagation before the LP: deduced bounds go onto the node (its children inherit
     // them), and a contradiction prunes the node without solving anything.
-    if state.options.propagate_rounds > 0 && !node.propagated {
-        node.propagated = true;
+    if state.options.propagate_rounds > 0 {
         let propagation = state.solver.propagate_bounds(state.options.propagate_rounds)?;
-        // Record even when infeasible: those bounds are in the solver already, and
+        // Mirror even when infeasible: those bounds are in the solver already, and
         // `state.applied` is what tells the next node to reset them.
-        record_propagated(state, &mut node, propagation.changes);
+        record_propagated(state, propagation.changes);
         if !propagation.feasible {
             state.stats.propagation_prunes += 1;
             state.last_solved_id = None;
