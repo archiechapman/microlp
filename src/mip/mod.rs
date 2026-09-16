@@ -7,7 +7,7 @@ pub(crate) mod branching;
 pub(crate) mod node;
 pub(crate) mod params;
 
-use crate::solver::{check_deadline, Deadline, Propagation, Solver};
+use crate::solver::{check_deadline, Deadline, Solver};
 use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
 use core::time::Duration;
 use node::{effective_bounds, Node};
