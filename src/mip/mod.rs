@@ -245,6 +245,8 @@ pub struct Stats {
     pub bounds_tightened: u64,
     /// Nodes propagation proved infeasible before any LP was solved.
     pub propagation_prunes: u64,
+    /// Nodes whose LP was abandoned once its bound passed the pruning cutoff.
+    pub cutoff_prunes: u64,
 }
 
 /// A feasible integer assignment, in internal (minimize) objective space.
@@ -883,7 +885,12 @@ fn enumerate_candidate(
             ));
         }
 
-        match solve_node_lp(state)? {
+        let (node_lp, cut_off) = solve_node_lp_bounded(state)?;
+        if cut_off {
+            state.stats.cutoff_prunes += 1;
+            return Ok(IntegralCandidate::Closed);
+        }
+        match node_lp {
             NodeLp::Solved => {}
             NodeLp::Infeasible => return Ok(IntegralCandidate::Closed),
             NodeLp::Limit => return Ok(IntegralCandidate::Limit),
@@ -1105,6 +1112,30 @@ enum NodeLp {
 /// the node from scratch, then take that retry's outcome as final. The retry
 /// cannot loop: it is attempted at most once and its own internal error is
 /// propagated rather than retried again.
+/// The objective beyond which this node cannot hold anything useful: the incumbent's
+/// pruning cutoff, an enumeration's fixed cutoff, or the tighter of the two.
+fn node_cutoff(state: &MipState) -> Option<f64> {
+    let incumbent = state
+        .incumbent
+        .as_ref()
+        .map(|inc| cutoff(inc.objective, state.options.tolerances.prune_epsilon));
+    match (incumbent, enumeration_cutoff(state)) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// [`solve_node_lp`] with the node's cutoff armed: the dual simplex may stop as soon as
+/// the bound passes it (see [`Solver::set_objective_cutoff`]). The flag says the solve
+/// stopped that way, so the node is pruned and its objective is not a solved LP value.
+fn solve_node_lp_bounded(state: &mut MipState) -> Result<(NodeLp, bool), Error> {
+    state.solver.set_objective_cutoff(node_cutoff(state));
+    let result = solve_node_lp(state);
+    let cut_off = state.solver.cutoff_reached();
+    state.solver.set_objective_cutoff(None);
+    Ok((result?, cut_off))
+}
+
 fn solve_node_lp(state: &mut MipState) -> Result<NodeLp, Error> {
     state.solver.deadline = state.deadline;
     let err = match state.solver.reoptimize() {
@@ -1510,7 +1541,15 @@ fn visit_node(
             .map_err(|e| Error::InternalError(format!("slack basis load failed: {}", e)))?;
     }
 
-    match solve_node_lp(state)? {
+    let (node_lp, cut_off) = solve_node_lp_bounded(state)?;
+    if cut_off {
+        // The bound passed the cutoff mid-solve: nothing here can improve on it.
+        state.stats.cutoff_prunes += 1;
+        state.last_solved_id = None;
+        state.diving = false;
+        return Ok(NodeVisit::Solved);
+    }
+    match node_lp {
         NodeLp::Solved => {}
         NodeLp::Infeasible => {
             state.last_solved_id = None;
