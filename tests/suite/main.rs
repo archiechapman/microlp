@@ -30,6 +30,7 @@ mod rng;
 mod verify;
 
 use cases::{Case, CaseRun, Tier};
+use microlp::SolveOptions;
 use model::Expected;
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
@@ -50,6 +51,39 @@ struct Options {
     /// Custom cases are responsible for forwarding this budget to their solves.
     max_case_seconds: Option<f64>,
     parallel: usize,
+    /// Solve options applied to every `CaseRun::Solve` case, for comparing search
+    /// configurations over the suite's instances (see `--csv`). `CaseRun::Custom`
+    /// cases drive their own solves and ignore these.
+    solve: SolveConfig,
+    /// Write one row per case (status, time, nodes, ...) to this file.
+    csv: Option<String>,
+}
+
+/// Search configuration under test.
+#[derive(Clone, Copy, Default)]
+struct SolveConfig {
+    gomory_rounds: u32,
+    strong_branch: u32,
+}
+
+impl SolveConfig {
+    fn options(&self, budget: Duration) -> SolveOptions {
+        let mut options = SolveOptions::default();
+        options.time_limit = Some(budget);
+        options.gomory_rounds = self.gomory_rounds;
+        options.strong_branch_reliability = self.strong_branch;
+        options
+    }
+}
+
+/// What a solved case cost, for `--csv`.
+#[derive(Clone, Copy, Default)]
+struct CaseStats {
+    nodes: u64,
+    lp_iterations: u64,
+    root_cuts: u64,
+    strong_branch_lps: u64,
+    objective: Option<f64>,
 }
 
 fn parse_args() -> Options {
@@ -63,6 +97,8 @@ fn parse_args() -> Options {
         timeout_scale: 1.0,
         max_case_seconds: None,
         parallel: 1,
+        solve: SolveConfig::default(),
+        csv: None,
     };
     // If several tier flags are given, the highest wins.
     fn raise_tier(opts: &mut Options, tier: Tier) {
@@ -107,6 +143,18 @@ fn parse_args() -> Options {
                 }
                 opts.max_case_seconds = Some(secs);
             }
+            "--gomory" => {
+                let v = take_value(&args, &mut i, "--gomory");
+                opts.solve.gomory_rounds =
+                    v.parse().unwrap_or_else(|_| die("--gomory must be a number"));
+            }
+            "--strong-branch" => {
+                let v = take_value(&args, &mut i, "--strong-branch");
+                opts.solve.strong_branch = v
+                    .parse()
+                    .unwrap_or_else(|_| die("--strong-branch must be a number"));
+            }
+            "--csv" => opts.csv = Some(take_value(&args, &mut i, "--csv")),
             "--easy" => raise_tier(&mut opts, Tier::Easy),
             "--medium" => raise_tier(&mut opts, Tier::Medium),
             "--hard" => raise_tier(&mut opts, Tier::Hard),
@@ -185,12 +233,21 @@ OPTIONS:
                         (applied after --timeout-scale; used by CI to bound
                         any single instance's runtime)
         --list          print the selected case names and exit
+        --gomory <N>    root Gomory cut rounds for every solve case
+        --strong-branch <N>  strong-branching reliability threshold for every
+                        solve case
+        --csv <PATH>    write one row per case (status, time, nodes, LP
+                        iterations, cuts, strong-branch LPs) for comparing
+                        search configurations across the suite's instances
     -h, --help          show this help
 
 Notes:
     * Case generation is deterministic and independent of --seed; the seed
       only shuffles which subset --limit picks and in what order.
-    * Pass a failing case's full name as a filter to reproduce it alone."
+    * Pass a failing case's full name as a filter to reproduce it alone.
+    * --gomory/--strong-branch apply to plain solve cases only; cases that
+      drive their own solves (resume, warm start, edits) ignore them and are
+      written to --csv without statistics."
     );
 }
 
@@ -295,7 +352,7 @@ fn main() {
     }));
 
     let suite_start = Instant::now();
-    let mut results: Vec<(String, Status, Duration)> = vec![];
+    let mut results: Vec<(String, Status, Duration, Option<CaseStats>)> = vec![];
     let width = all.iter().map(|c| c.name.len()).max().unwrap_or(0);
 
     let mut completed = 0;
@@ -304,7 +361,14 @@ fn main() {
             print!("{:width$}  ", case.name, width = width);
             std::io::stdout().flush().ok();
             let started = Instant::now();
-            let status = run_case(case, opts.timeout_scale, opts.max_case_seconds);
+            let mut stats = None;
+            let status = run_case(
+                case,
+                opts.timeout_scale,
+                opts.max_case_seconds,
+                opts.solve,
+                &mut stats,
+            );
             let elapsed = started.elapsed();
             completed += 1;
             let left = all.len() - completed;
@@ -343,7 +407,7 @@ fn main() {
                     msg.lines().collect::<Vec<_>>().join(" | ")
                 ),
             }
-            results.push((case.name.clone(), status, elapsed));
+            results.push((case.name.clone(), status, elapsed, stats));
         }
     } else {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -352,6 +416,7 @@ fn main() {
 
         let next_index = AtomicUsize::new(0);
         let all_cases = &all;
+        let solve_config = opts.solve;
         let (tx, rx) = mpsc::channel();
 
         thread::scope(|s| {
@@ -366,9 +431,16 @@ fn main() {
                     }
                     let case = &all_cases[idx];
                     let started = Instant::now();
-                    let status = run_case(case, opts.timeout_scale, opts.max_case_seconds);
+                    let mut stats = None;
+                    let status = run_case(
+                        case,
+                        opts.timeout_scale,
+                        opts.max_case_seconds,
+                        solve_config,
+                        &mut stats,
+                    );
                     let elapsed = started.elapsed();
-                    if tx.send((idx, status, elapsed)).is_err() {
+                    if tx.send((idx, status, elapsed, stats)).is_err() {
                         break;
                     }
                 });
@@ -379,7 +451,7 @@ fn main() {
 
             // Print results in real time as they complete
             let mut completed = 0;
-            while let Ok((idx, status, elapsed)) = rx.recv() {
+            while let Ok((idx, status, elapsed, stats)) = rx.recv() {
                 completed += 1;
                 let left = all_cases.len() - completed;
                 let case = &all_cases[idx];
@@ -432,7 +504,7 @@ fn main() {
                         );
                     }
                 }
-                results.push((case.name.clone(), status, elapsed));
+                results.push((case.name.clone(), status, elapsed, stats));
             }
         });
     }
@@ -443,25 +515,33 @@ fn main() {
     let total = results.len();
     let passed = results
         .iter()
-        .filter(|(_, s, _)| matches!(s, Status::Pass(_)))
+        .filter(|(_, s, _, _)| matches!(s, Status::Pass(_)))
         .count();
     let failed: Vec<_> = results
         .iter()
-        .filter(|(_, s, _)| matches!(s, Status::Fail(_)))
+        .filter(|(_, s, _, _)| matches!(s, Status::Fail(_)))
         .collect();
     let timeouts: Vec<_> = results
         .iter()
-        .filter(|(_, s, _)| matches!(s, Status::Timeout))
+        .filter(|(_, s, _, _)| matches!(s, Status::Timeout))
         .collect();
     let panics: Vec<_> = results
         .iter()
-        .filter(|(_, s, _)| matches!(s, Status::Panic(_)))
+        .filter(|(_, s, _, _)| matches!(s, Status::Panic(_)))
         .collect();
+
+    if let Some(path) = &opts.csv {
+        if let Err(e) = write_csv(path, &results) {
+            eprintln!("error: could not write {}: {}", path, e);
+            std::process::exit(2);
+        }
+        println!("\nwrote {} ({} cases)", path, results.len());
+    }
 
     println!();
     if !failed.is_empty() || !timeouts.is_empty() || !panics.is_empty() {
         println!("failing cases (rerun one with: cargo test --release --test suite -- <name>):");
-        for (name, status, _) in results.iter() {
+        for (name, status, _, _) in results.iter() {
             match status {
                 Status::Fail(msg) => println!("  FAIL    {}\n          {}", name, msg),
                 Status::Timeout => println!("  TIMEOUT {}", name),
@@ -477,11 +557,11 @@ fn main() {
     }
 
     let mut slowest: Vec<_> = results.iter().collect();
-    slowest.sort_by_key(|(_, _, d)| std::cmp::Reverse(*d));
+    slowest.sort_by_key(|(_, _, d, _)| std::cmp::Reverse(*d));
     let slow_list = slowest
         .iter()
         .take(5)
-        .map(|(n, _, d)| format!("{} {}", n, fmt_duration(*d)))
+        .map(|(n, _, d, _)| format!("{} {}", n, fmt_duration(*d)))
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -508,6 +588,47 @@ fn main() {
     }
 }
 
+/// One row per case: status and cost, for comparing search configurations.
+/// Cases that drive their own solves have no statistics and leave those columns empty.
+fn write_csv(
+    path: &str,
+    results: &[(String, Status, Duration, Option<CaseStats>)],
+) -> std::io::Result<()> {
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writeln!(
+        out,
+        "case,status,seconds,nodes,lp_iterations,root_cuts,strong_branch_lps,objective"
+    )?;
+    for (name, status, elapsed, stats) in results {
+        let status = match status {
+            Status::Pass(_) => "pass",
+            Status::Fail(_) => "fail",
+            Status::Timeout => "timeout",
+            Status::Panic(_) => "panic",
+        };
+        let cost = match stats {
+            Some(s) => format!(
+                "{},{},{},{},{}",
+                s.nodes,
+                s.lp_iterations,
+                s.root_cuts,
+                s.strong_branch_lps,
+                s.objective.map(|v| v.to_string()).unwrap_or_default()
+            ),
+            None => ",,,,".to_string(),
+        };
+        writeln!(
+            out,
+            "{},{},{:.6},{}",
+            name,
+            status,
+            elapsed.as_secs_f64(),
+            cost
+        )?;
+    }
+    out.flush()
+}
+
 thread_local! {
     static LAST_PANIC: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     pub static LAST_SOLVE: std::cell::RefCell<Option<(f64, f64)>> = const { std::cell::RefCell::new(None) };
@@ -523,18 +644,34 @@ fn effective_budget(base: Duration, timeout_scale: f64, max_case_seconds: Option
     }
 }
 
-fn run_case(case: &Case, timeout_scale: f64, max_case_seconds: Option<f64>) -> Status {
+fn run_case(
+    case: &Case,
+    timeout_scale: f64,
+    max_case_seconds: Option<f64>,
+    solve: SolveConfig,
+    stats_out: &mut Option<CaseStats>,
+) -> Status {
     let budget = effective_budget(case.budget, timeout_scale, max_case_seconds);
+    let mut stats = None;
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         LAST_SOLVE.with(|slot| *slot.borrow_mut() = None);
         match &case.run {
             CaseRun::Solve(build) => {
-                let (spec, mut problem, expected) = match build() {
+                let (spec, problem, expected) = match build() {
                     Ok(parts) => parts,
                     Err(msg) => return Status::Fail(format!("case build failed: {}", msg)),
                 };
-                problem.set_time_limit(budget);
-                let solve_result = problem.solve();
+                let solve_result = problem.solve_with(solve.options(budget));
+                if let Ok(outcome) = &solve_result {
+                    let s = outcome.stats();
+                    stats = Some(CaseStats {
+                        nodes: s.nodes_solved,
+                        lp_iterations: s.lp_iterations,
+                        root_cuts: s.root_cuts,
+                        strong_branch_lps: s.strong_branch_lps,
+                        objective: outcome.solution().map(|sol| sol.objective()),
+                    });
+                }
                 let details = match (&solve_result, &expected) {
                     (Ok(outcome), Expected::Objective { value, .. }) => {
                         outcome.solution().map(|sol| SolveDetails {
@@ -569,6 +706,7 @@ fn run_case(case: &Case, timeout_scale: f64, max_case_seconds: Option<f64>) -> S
             },
         }
     }));
+    *stats_out = stats;
     match outcome {
         Ok(status) => status,
         Err(payload) => {
