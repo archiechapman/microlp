@@ -91,6 +91,10 @@ pub struct SolveOptions {
     /// equally optimal solutions is returned, including between an uninterrupted solve
     /// and the same solve resumed from a node limit. The objective is unaffected.
     pub propagate_rounds: u32,
+    /// Stop a node's LP as soon as its bound passes the pruning cutoff, instead of
+    /// solving on to an optimum the node will be pruned against anyway. Default `true`;
+    /// turning it off only costs time (it exists for measurement).
+    pub cutoff_prune: bool,
 }
 
 impl Default for SolveOptions {
@@ -105,6 +109,7 @@ impl Default for SolveOptions {
             gomory_rounds: 0,
             strong_branch_reliability: 0,
             propagate_rounds: 0,
+            cutoff_prune: true,
         }
     }
 }
@@ -1115,6 +1120,9 @@ enum NodeLp {
 /// The objective beyond which this node cannot hold anything useful: the incumbent's
 /// pruning cutoff, an enumeration's fixed cutoff, or the tighter of the two.
 fn node_cutoff(state: &MipState) -> Option<f64> {
+    if !state.options.cutoff_prune {
+        return None;
+    }
     let incumbent = state
         .incumbent
         .as_ref()
