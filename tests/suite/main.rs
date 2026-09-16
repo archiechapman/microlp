@@ -64,6 +64,7 @@ struct Options {
 struct SolveConfig {
     gomory_rounds: u32,
     strong_branch: u32,
+    propagate: u32,
 }
 
 impl SolveConfig {
@@ -72,6 +73,7 @@ impl SolveConfig {
         options.time_limit = Some(budget);
         options.gomory_rounds = self.gomory_rounds;
         options.strong_branch_reliability = self.strong_branch;
+        options.propagate_rounds = self.propagate;
         options
     }
 }
@@ -153,6 +155,12 @@ fn parse_args() -> Options {
                 opts.solve.strong_branch = v
                     .parse()
                     .unwrap_or_else(|_| die("--strong-branch must be a number"));
+            }
+            "--propagate" => {
+                let v = take_value(&args, &mut i, "--propagate");
+                opts.solve.propagate = v
+                    .parse()
+                    .unwrap_or_else(|_| die("--propagate must be a number"));
             }
             "--csv" => opts.csv = Some(take_value(&args, &mut i, "--csv")),
             "--easy" => raise_tier(&mut opts, Tier::Easy),
@@ -236,6 +244,7 @@ OPTIONS:
         --gomory <N>    root Gomory cut rounds for every solve case
         --strong-branch <N>  strong-branching reliability threshold for every
                         solve case
+        --propagate <N> bound-propagation sweeps per node for every solve case
         --csv <PATH>    write one row per case (status, time, nodes, LP
                         iterations, cuts, strong-branch LPs) for comparing
                         search configurations across the suite's instances
@@ -245,7 +254,7 @@ Notes:
     * Case generation is deterministic and independent of --seed; the seed
       only shuffles which subset --limit picks and in what order.
     * Pass a failing case's full name as a filter to reproduce it alone.
-    * --gomory/--strong-branch apply to plain solve cases only; cases that
+    * --gomory/--strong-branch/--propagate apply to plain solve cases only; cases that
       drive their own solves (resume, warm start, edits) ignore them and are
       written to --csv without statistics."
     );
