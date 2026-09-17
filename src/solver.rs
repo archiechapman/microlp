@@ -1076,6 +1076,17 @@ impl Solver {
                 .is_some_and(|cutoff| self.cur_obj_val > cutoff)
     }
 
+    /// [`Self::past_cutoff`] on values recomputed from the factorization. The running
+    /// objective carries the same pivot round-off as the basic values (see
+    /// [`Self::settle_phases`]), and a prune on a drifted objective discards the node for
+    /// good, so the incremental test alone doesn't decide it.
+    fn past_cutoff_recomputed(&mut self) -> Result<bool, Error> {
+        self.recalc_basic_var_vals()?;
+        self.recalc_obj_coeffs()?;
+        self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+        Ok(self.past_cutoff())
+    }
+
     fn optimize(&mut self) -> Result<StopReason, Error> {
         for iter in 0.. {
             if self.iterations_exhausted() {
@@ -1199,7 +1210,7 @@ impl Solver {
                 self.basis_repaired = false;
                 // Any successful pivot is progress: re-arm the valve.
                 refreshed_since_pivot = false;
-                if self.past_cutoff() {
+                if self.past_cutoff() && self.past_cutoff_recomputed()? {
                     debug!(
                         "restore feasibility iter {}: objective {} passed the cutoff; stopping",
                         iter, self.cur_obj_val
@@ -2795,6 +2806,39 @@ mod tests {
             assert!((a - b).abs() < 1e-9, "reduced cost of var {va}: {a} vs {b}");
         }
         assert!((eta_obj - solver.cur_obj_val).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cutoff_stop_is_decided_on_recomputed_objective() {
+        init();
+        // minimize x + y + z, pairwise sums >= 2, boxes [0, 10]: optimum x = y = z = 1.
+        // Tightening z to [0, 0.25] forces dual pivots towards the optimum 3.75.
+        let mut solver = Solver::try_new(
+            &[1.0, 1.0, 1.0],
+            &[0.0, 0.0, 0.0],
+            &[10.0, 10.0, 10.0],
+            &[
+                (to_sparse(&[1.0, 1.0, 0.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[0.0, 1.0, 1.0]), ComparisonOp::Ge, 2.0),
+                (to_sparse(&[1.0, 0.0, 1.0]), ComparisonOp::Ge, 2.0),
+            ],
+            &[VarDomain::Real, VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        solver.set_var_bounds(2, 0.0, 0.25).unwrap();
+        solver.set_objective_cutoff(Some(4.0));
+        // Round-off drift in the running objective: every dual pivot now reads it past
+        // the cutoff, though the LP optimum (3.75) is below it.
+        solver.cur_obj_val += 1.0;
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(!solver.cutoff_reached(), "pruned on a drifted objective");
+        assert!(
+            (solver.cur_obj_val - 3.75).abs() < 1e-9,
+            "{}",
+            solver.cur_obj_val
+        );
     }
 
     #[test]
