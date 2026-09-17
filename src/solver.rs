@@ -754,7 +754,19 @@ impl Solver {
     /// Alternate dual simplex (primal feasibility) and primal simplex (dual feasibility)
     /// until both hold. Normally one round; another is needed only when a basis repair
     /// inside a phase broke the feasibility that phase relied on.
+    ///
+    /// Pivots update the basic values, reduced costs and objective incrementally, and a
+    /// pivot with a large step (a small pivot element) leaves round-off in them that later
+    /// pivots carry forward. At an optimum the values are recomputed from the
+    /// factorization, and the phases run again if the recomputed point is not optimal
+    /// after all. Callers derive cuts, bounds and branching decisions from this point:
+    /// a Gomory cut built from a drifted basic value can cut off integer solutions
+    /// (case118 with a presolved model: a drift of 1e-3 after one cut round, and cuts that
+    /// removed the optimum). At most [`MAX_REFRESHES`] refreshes per call, so a point
+    /// whose recomputed values keep failing a tolerance by round-off cannot loop.
     fn settle_phases(&mut self) -> Result<StopReason, Error> {
+        const MAX_REFRESHES: usize = 2;
+        let mut refreshes = 0;
         for _ in 0..MAX_PHASE_ROUNDS {
             if !self.is_primal_feasible && self.restore_feasibility()? == StopReason::Limit {
                 return Ok(StopReason::Limit);
@@ -771,7 +783,21 @@ impl Solver {
                 }
             }
             if self.is_primal_feasible && self.is_dual_feasible {
-                return Ok(StopReason::Finished);
+                if refreshes == MAX_REFRESHES {
+                    return Ok(StopReason::Finished);
+                }
+                refreshes += 1;
+                self.recalc_basic_var_vals()?;
+                self.recalc_obj_coeffs()?;
+                self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+                self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+                if self.is_primal_feasible && self.is_dual_feasible {
+                    return Ok(StopReason::Finished);
+                }
+                debug!(
+                    "recomputed values at the optimum are not optimal (primal feasible: {}, dual feasible: {}); resuming",
+                    self.is_primal_feasible, self.is_dual_feasible
+                );
             }
         }
         Err(Error::InternalError(
@@ -2802,6 +2828,57 @@ mod tests {
             assert!((a - b).abs() < 1e-9, "reduced cost of var {va}: {a} vs {b}");
         }
         assert!((eta_obj - solver.cur_obj_val).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reoptimize_recomputes_drifted_values_before_cuts_use_them() {
+        init();
+        // minimize -x - y s.t. 2x + 2y <= 3, x, y integer in [0, 1]: the LP optimum has
+        // x + y = 1.5 with one of them basic at 0.5. Its GMI cut is 2x + 2y <= 2.
+        let mut solver = Solver::try_new(
+            &[-1.0, -1.0],
+            &[0.0, 0.0],
+            &[1.0, 1.0],
+            &[(to_sparse(&[2.0, 2.0]), ComparisonOp::Le, 3.0)],
+            &[VarDomain::Integer, VarDomain::Integer],
+            None,
+        )
+        .unwrap();
+        assert_eq!(solver.initial_solve().unwrap(), StopReason::Finished);
+        let (row, var) = solver
+            .basic_vars
+            .iter()
+            .enumerate()
+            .find(|&(_, &v)| v < 2)
+            .map(|(r, &v)| (r, v))
+            .expect("a structural variable is basic");
+        assert!((solver.basic_var_vals[row] - 0.5).abs() < 1e-9);
+
+        // Round-off drift of the kind long pivot sequences leave: still inside the bounds,
+        // so no feasibility flag notices it.
+        solver.basic_var_vals[row] += 0.01;
+        solver.cur_obj_val -= 0.01;
+        assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+        assert!(
+            (*solver.get_value(var) - 0.5).abs() < 1e-9,
+            "drifted basic value kept: {}",
+            solver.get_value(var)
+        );
+        assert!((solver.cur_obj_val + 1.5).abs() < 1e-9);
+
+        // With f0 = 0.51 instead of 0.5 the cut would be 2x + 2y <= 1.98, cutting off
+        // (1, 0) and (0, 1).
+        let cuts = solver.gomory_cuts(10);
+        assert!(!cuts.is_empty());
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)] {
+            for (coeffs, rhs) in &cuts {
+                let act: f64 = coeffs.iter().map(|(j, &c)| c * [x, y][j]).sum();
+                assert!(
+                    act >= rhs - 1e-9,
+                    "cut {coeffs:?} >= {rhs} cuts off ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]
