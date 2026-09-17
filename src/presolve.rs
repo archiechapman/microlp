@@ -36,6 +36,8 @@
 //! nodes on a sub-second solve). The code is in the history at `dd276a2`.
 
 use crate::{ComparisonOp, CsVec, Error, OptimizationDirection, Problem, VarDomain};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 /// Coefficients at or below this magnitude, relative to the largest magnitude
 /// they were computed from, are treated as cancelled to zero.
@@ -57,6 +59,8 @@ pub(crate) struct Postsolve {
     kept: Vec<usize>,
     /// Reduced column of each original column, if it was kept.
     reduced_of: Vec<Option<usize>>,
+    /// Index into `ops` of the elimination of each removed original column.
+    op_of: Vec<Option<usize>>,
     /// Eliminations in the order they were made; postsolve replays them backwards.
     ops: Vec<Op>,
     /// Constant term (internal minimization space) moved out of the objective.
@@ -102,6 +106,63 @@ impl Postsolve {
             }
         }
         x
+    }
+
+    /// Rewrites the row `Σ a·x[c] (op) rhs` over original columns as a row over
+    /// reduced columns: eliminated columns are replaced by the expressions
+    /// postsolve uses for them, and constants move into the right-hand side.
+    pub(crate) fn forward_row(&self, terms: &[(usize, f64)], rhs: f64) -> (Vec<(usize, f64)>, f64) {
+        let mut rhs = rhs;
+        let mut reduced: BTreeMap<usize, f64> = BTreeMap::new();
+        let mut eliminated: HashMap<usize, f64> = HashMap::new();
+        // An op only references columns eliminated by later ops, so expanding in
+        // op order finalises each coefficient before it is expanded.
+        let mut heap = BinaryHeap::new();
+        let mut scale = 0.0f64;
+        let mut add = |col: usize,
+                       a: f64,
+                       reduced: &mut BTreeMap<usize, f64>,
+                       eliminated: &mut HashMap<usize, f64>,
+                       heap: &mut BinaryHeap<Reverse<usize>>| {
+            scale = scale.max(a.abs());
+            if let Some(r) = self.reduced_of[col] {
+                *reduced.entry(r).or_insert(0.0) += a;
+            } else {
+                let entry = eliminated.entry(col).or_insert_with(|| {
+                    heap.push(Reverse(self.op_of[col].expect("removed column has an op")));
+                    0.0
+                });
+                *entry += a;
+            }
+        };
+        for &(c, a) in terms {
+            add(c, a, &mut reduced, &mut eliminated, &mut heap);
+        }
+        while let Some(Reverse(k)) = heap.pop() {
+            match &self.ops[k] {
+                Op::Fix { col, value } => {
+                    let a = eliminated.remove(col).unwrap();
+                    rhs -= a * value;
+                }
+                Op::Substitute {
+                    col,
+                    pivot,
+                    rhs: op_rhs,
+                    terms,
+                } => {
+                    let a = eliminated.remove(col).unwrap();
+                    rhs -= a * op_rhs / pivot;
+                    for &(c, t) in terms {
+                        add(c, -a * t / pivot, &mut reduced, &mut eliminated, &mut heap);
+                    }
+                }
+            }
+        }
+        let terms = reduced
+            .into_iter()
+            .filter(|&(_, a)| a.abs() > DROP_TOL * scale)
+            .collect();
+        (terms, rhs)
     }
 }
 
@@ -687,6 +748,11 @@ impl Presolver {
                 kept.push(c);
             }
         }
+        let mut op_of = vec![None; num_orig];
+        for (k, op) in self.ops.iter().enumerate() {
+            let (Op::Fix { col, .. } | Op::Substitute { col, .. }) = op;
+            op_of[*col] = Some(k);
+        }
         let n = kept.len();
         let mut constraints = Vec::new();
         for row in self.rows.iter().filter(|r| r.alive && !r.terms.is_empty()) {
@@ -727,6 +793,7 @@ impl Presolver {
                 num_orig,
                 kept,
                 reduced_of,
+                op_of,
                 ops: self.ops,
                 offset: self.offset,
             },
