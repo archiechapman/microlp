@@ -331,13 +331,6 @@ fn build_state(problem: &Problem, mut options: SolveOptions) -> Result<MipState,
     let base = problem.clone();
     let (problem, postsolve) = if options.presolve {
         let presolved = presolve(problem, options.tolerances.feasibility, options.int_tol)?;
-        debug!(
-            "presolve: {} x {} -> {} x {}",
-            base.constraints.len(),
-            base.obj_coeffs.len(),
-            presolved.problem.constraints.len(),
-            presolved.problem.obj_coeffs.len()
-        );
         // Hints name original variables; keep the ones that survived.
         if let Some(hints) = options.warm_start.take() {
             let p = &presolved.postsolve;

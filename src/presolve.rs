@@ -200,7 +200,16 @@ pub(crate) fn presolve(problem: &Problem, feas_tol: f64, int_tol: f64) -> Result
     }) {
         return Err(Error::Infeasible);
     }
-    Ok(p.finish(problem.direction))
+    let presolved = p.finish(problem.direction);
+    debug!(
+        "presolve: {} rows x {} cols -> {} x {}, {} eliminations",
+        problem.constraints.len(),
+        n,
+        presolved.problem.constraints.len(),
+        presolved.problem.obj_coeffs.len(),
+        presolved.postsolve.ops.len()
+    );
+    Ok(presolved)
 }
 
 fn rel_eps(v: f64) -> f64 {
