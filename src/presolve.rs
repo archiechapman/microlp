@@ -195,9 +195,10 @@ pub(crate) fn presolve(problem: &Problem, feas_tol: f64, int_tol: f64) -> Result
     };
     p.run()?;
     // The pass limit can stop the loop with rows that were never re-checked.
-    if p.rows.iter().any(|r| {
-        r.alive && r.terms.is_empty() && (r.lo > feas_tol || r.hi < -feas_tol)
-    }) {
+    if p.rows
+        .iter()
+        .any(|r| r.alive && r.terms.is_empty() && (r.lo > feas_tol || r.hi < -feas_tol))
+    {
         return Err(Error::Infeasible);
     }
     let presolved = p.finish(problem.direction);
@@ -450,7 +451,11 @@ impl Presolver {
             self.remove_row(r);
             for (c, a) in terms {
                 let at_lo = (a > 0.0) == forcing_low;
-                let value = if at_lo { self.cols[c].lo } else { self.cols[c].hi };
+                let value = if at_lo {
+                    self.cols[c].lo
+                } else {
+                    self.cols[c].hi
+                };
                 self.fix_col(c, value);
             }
             return Ok(());
@@ -473,8 +478,16 @@ impl Presolver {
             }
             let (ilo, ihi) = self.implied_bounds(r, &act, c, a);
             let margin = self.int_tol.max(DROP_TOL * act.mag);
-            let ilo = if ilo.abs() < HUGE_BOUND { ilo - margin } else { f64::NEG_INFINITY };
-            let ihi = if ihi.abs() < HUGE_BOUND { ihi + margin } else { f64::INFINITY };
+            let ilo = if ilo.abs() < HUGE_BOUND {
+                ilo - margin
+            } else {
+                f64::NEG_INFINITY
+            };
+            let ihi = if ihi.abs() < HUGE_BOUND {
+                ihi + margin
+            } else {
+                f64::INFINITY
+            };
             self.tighten(c, ilo, ihi)?;
         }
         Ok(())
@@ -647,7 +660,11 @@ impl Presolver {
         self.remove_row(r);
         let other_rows = std::mem::take(&mut self.cols[j].rows);
         for k in other_rows {
-            let pos = self.rows[k].terms.iter().position(|&(c, _)| c == j).unwrap();
+            let pos = self.rows[k]
+                .terms
+                .iter()
+                .position(|&(c, _)| c == j)
+                .unwrap();
             let (_, akj) = self.rows[k].terms.swap_remove(pos);
             let factor = akj / pivot;
             for &(c, a) in &terms {
@@ -726,7 +743,12 @@ impl Presolver {
             let (idx, val): (Vec<usize>, Vec<f64>) = row
                 .terms
                 .iter()
-                .map(|&(c, a)| (reduced_of[c].expect("live row references a removed column"), a))
+                .map(|&(c, a)| {
+                    (
+                        reduced_of[c].expect("live row references a removed column"),
+                        a,
+                    )
+                })
                 .unzip();
             let vec = || CsVec::new_from_unsorted(n, idx.clone(), val.clone()).unwrap();
             if row.lo == row.hi {
@@ -909,6 +931,9 @@ mod tests {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let x = problem.add_integer_var(1.0, (0, 3));
         problem.add_constraint([(x, 2.0)], ComparisonOp::Eq, 3.0); // x = 1.5
-        assert!(matches!(presolve(&problem, 1e-7, 1e-6), Err(Error::Infeasible)));
+        assert!(matches!(
+            presolve(&problem, 1e-7, 1e-6),
+            Err(Error::Infeasible)
+        ));
     }
 }

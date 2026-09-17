@@ -7,10 +7,10 @@ pub(crate) mod branching;
 pub(crate) mod node;
 pub(crate) mod params;
 
+use crate::presolve::{presolve, Postsolve};
 use crate::solver::{check_deadline, Deadline, Solver};
 use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
 use core::time::Duration;
-use crate::presolve::{presolve, Postsolve};
 use node::{effective_bounds, Node};
 use std::collections::BTreeMap;
 use web_time::Instant;

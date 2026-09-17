@@ -312,7 +312,12 @@ fn main() {
             print!("{:width$}  ", case.name, width = width);
             std::io::stdout().flush().ok();
             let started = Instant::now();
-            let status = run_case(case, opts.timeout_scale, opts.max_case_seconds, opts.presolve);
+            let status = run_case(
+                case,
+                opts.timeout_scale,
+                opts.max_case_seconds,
+                opts.presolve,
+            );
             let elapsed = started.elapsed();
             completed += 1;
             let left = all.len() - completed;
@@ -374,7 +379,12 @@ fn main() {
                     }
                     let case = &all_cases[idx];
                     let started = Instant::now();
-                    let status = run_case(case, opts.timeout_scale, opts.max_case_seconds, opts.presolve);
+                    let status = run_case(
+                        case,
+                        opts.timeout_scale,
+                        opts.max_case_seconds,
+                        opts.presolve,
+                    );
                     let elapsed = started.elapsed();
                     if tx.send((idx, status, elapsed)).is_err() {
                         break;
