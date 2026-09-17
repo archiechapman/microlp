@@ -10,6 +10,7 @@ pub(crate) mod params;
 use crate::solver::{check_deadline, Deadline, Solver};
 use crate::{ComparisonOp, Error, OptimizationDirection, Problem, StopReason, VarDomain, Variable};
 use core::time::Duration;
+use crate::presolve::{presolve, Postsolve};
 use node::{effective_bounds, Node};
 use std::collections::BTreeMap;
 use web_time::Instant;
@@ -68,6 +69,12 @@ pub struct SolveOptions {
     /// field only once you understand the correctness/permissiveness
     /// trade-off documented on it.
     pub tolerances: Tolerances,
+    /// Run a primal presolve before a mixed-integer search (see
+    /// `src/presolve.rs`). Reductions use bounds and rows only, never the
+    /// objective, so every feasible point survives; values and objectives are
+    /// always reported for the original variables. Pure LPs ignore this
+    /// option. Default `false`.
+    pub presolve: bool,
 }
 
 impl Default for SolveOptions {
@@ -79,6 +86,7 @@ impl Default for SolveOptions {
             int_tol: 1e-6,
             warm_start: None,
             tolerances: Tolerances::default(),
+            presolve: false,
         }
     }
 }
@@ -255,6 +263,10 @@ pub(crate) struct MipState {
     /// relaxation as either integer-feasible (the original MILP is unbounded)
     /// or integer-infeasible.
     pub classifying_unbounded: bool,
+    /// Present when `solver` holds a presolved problem: maps its points back to
+    /// `base`'s variables. Incumbent values are always in `base`'s space;
+    /// objectives and bounds held internally exclude `postsolve.offset`.
+    pub postsolve: Option<Postsolve>,
 }
 
 impl std::fmt::Debug for MipState {
@@ -279,14 +291,32 @@ impl MipState {
     /// point without an incumbent is evaluated against the original model.
     pub(crate) fn current_objective(&self) -> f64 {
         if let Some(incumbent) = &self.incumbent {
-            return incumbent.objective;
+            return incumbent.objective + self.objective_offset();
         }
+        let values = self.original_values(
+            &(0..self.solver.num_vars)
+                .map(|v| *self.solver.get_value(v))
+                .collect::<Vec<_>>(),
+        );
         self.base
             .obj_coeffs
             .iter()
-            .enumerate()
-            .map(|(v, &coefficient)| coefficient * self.solver.get_value(v))
+            .zip(&values)
+            .map(|(&coefficient, &value)| coefficient * value)
             .sum()
+    }
+
+    /// Internal objective constant removed by presolve.
+    pub(crate) fn objective_offset(&self) -> f64 {
+        self.postsolve.as_ref().map_or(0.0, |p| p.offset)
+    }
+
+    /// `base`-space values for a point of the solver's problem.
+    pub(crate) fn original_values(&self, values: &[f64]) -> Vec<f64> {
+        match &self.postsolve {
+            Some(postsolve) => postsolve.values(values),
+            None => values.to_vec(),
+        }
     }
 }
 
@@ -296,8 +326,33 @@ pub(crate) struct MipRun {
     pub state: MipState,
 }
 
-fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Error> {
+fn build_state(problem: &Problem, mut options: SolveOptions) -> Result<MipState, Error> {
     let deadline = options.time_limit.map(|d| Instant::now() + d);
+    let base = problem.clone();
+    let (problem, postsolve) = if options.presolve {
+        let presolved = presolve(problem, options.tolerances.feasibility, options.int_tol)?;
+        debug!(
+            "presolve: {} x {} -> {} x {}",
+            base.constraints.len(),
+            base.obj_coeffs.len(),
+            presolved.problem.constraints.len(),
+            presolved.problem.obj_coeffs.len()
+        );
+        // Hints name original variables; keep the ones that survived.
+        if let Some(hints) = options.warm_start.take() {
+            let p = &presolved.postsolve;
+            options.warm_start = Some(
+                hints
+                    .into_iter()
+                    .filter_map(|(var, val)| p.reduced_col(var.idx()).map(|r| (Variable(r), val)))
+                    .collect(),
+            );
+        }
+        (presolved.problem, Some(presolved.postsolve))
+    } else {
+        (base.clone(), None)
+    };
+    let problem = &problem;
     let solver = problem.build_solver(deadline)?;
     let root_bounds = problem
         .var_mins
@@ -321,9 +376,10 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         deadline,
         direction: problem.direction,
         pseudocosts,
-        base: problem.clone(),
+        base,
         fixed: BTreeMap::new(),
         classifying_unbounded: false,
+        postsolve,
     })
 }
 
@@ -529,9 +585,10 @@ fn fill_bound_stats(state: &mut MipState) {
         return;
     }
     let bound = global_bound_internal(state);
-    state.stats.best_bound = bound.map(|b| to_user_space(state.direction, b));
+    let offset = state.objective_offset();
+    state.stats.best_bound = bound.map(|b| to_user_space(state.direction, b + offset));
     state.stats.gap = match (&state.incumbent, bound) {
-        (Some(inc), Some(b)) => Some(relative_gap(inc.objective, b)),
+        (Some(inc), Some(b)) => Some(relative_gap(inc.objective + offset, b + offset)),
         _ => None,
     };
 }
@@ -566,6 +623,24 @@ fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
         debug!("integral-within-tol solution rejected: objective is non-finite");
         return Ok(false);
     }
+    let values = match &state.postsolve {
+        None => values,
+        Some(postsolve) => {
+            let mut original = postsolve.values(&values);
+            for (val, dom) in original.iter_mut().zip(&state.base.var_domains) {
+                if matches!(dom, VarDomain::Integer | VarDomain::Boolean)
+                    && (*val - val.round()).abs() <= tolerances.integrality_rounding
+                {
+                    *val = val.round();
+                }
+            }
+            if !incumbent_feasible(&state.base, &state.fixed, &original, tolerances) {
+                debug!("integral-within-tol solution rejected: postsolved values infeasible");
+                return Ok(false);
+            }
+            original
+        }
+    };
     let better = match &state.incumbent {
         Some(inc) => objective < inc.objective,
         None => true,

@@ -30,6 +30,7 @@ mod rng;
 mod verify;
 
 use cases::{Case, CaseRun, Tier};
+use microlp::SolveOptions;
 use model::Expected;
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
@@ -50,6 +51,8 @@ struct Options {
     /// Custom cases are responsible for forwarding this budget to their solves.
     max_case_seconds: Option<f64>,
     parallel: usize,
+    /// Solve every `CaseRun::Solve` case with `SolveOptions::presolve` on.
+    presolve: bool,
 }
 
 fn parse_args() -> Options {
@@ -62,6 +65,7 @@ fn parse_args() -> Options {
         list: false,
         timeout_scale: 1.0,
         max_case_seconds: None,
+        presolve: false,
         parallel: 1,
     };
     // If several tier flags are given, the highest wins.
@@ -116,6 +120,7 @@ fn parse_args() -> Options {
                  medium and xhard tiers (--xhard runs everything)",
             ),
             "--full" => opts.full = true,
+            "--presolve" => opts.presolve = true,
             "--list" => opts.list = true,
             "--help" | "-h" => {
                 print_help();
@@ -184,13 +189,16 @@ OPTIONS:
         --max-case-seconds <S>  cap every per-case budget at S seconds
                         (applied after --timeout-scale; used by CI to bound
                         any single instance's runtime)
+        --presolve      solve every plain solve case with SolveOptions::presolve
         --list          print the selected case names and exit
     -h, --help          show this help
 
 Notes:
     * Case generation is deterministic and independent of --seed; the seed
       only shuffles which subset --limit picks and in what order.
-    * Pass a failing case's full name as a filter to reproduce it alone."
+    * Pass a failing case's full name as a filter to reproduce it alone.
+    * --presolve applies to plain solve cases only; cases that drive their own
+      solves (resume, warm start, edits) ignore it."
     );
 }
 
@@ -304,7 +312,7 @@ fn main() {
             print!("{:width$}  ", case.name, width = width);
             std::io::stdout().flush().ok();
             let started = Instant::now();
-            let status = run_case(case, opts.timeout_scale, opts.max_case_seconds);
+            let status = run_case(case, opts.timeout_scale, opts.max_case_seconds, opts.presolve);
             let elapsed = started.elapsed();
             completed += 1;
             let left = all.len() - completed;
@@ -366,7 +374,7 @@ fn main() {
                     }
                     let case = &all_cases[idx];
                     let started = Instant::now();
-                    let status = run_case(case, opts.timeout_scale, opts.max_case_seconds);
+                    let status = run_case(case, opts.timeout_scale, opts.max_case_seconds, opts.presolve);
                     let elapsed = started.elapsed();
                     if tx.send((idx, status, elapsed)).is_err() {
                         break;
@@ -523,7 +531,12 @@ fn effective_budget(base: Duration, timeout_scale: f64, max_case_seconds: Option
     }
 }
 
-fn run_case(case: &Case, timeout_scale: f64, max_case_seconds: Option<f64>) -> Status {
+fn run_case(
+    case: &Case,
+    timeout_scale: f64,
+    max_case_seconds: Option<f64>,
+    presolve: bool,
+) -> Status {
     let budget = effective_budget(case.budget, timeout_scale, max_case_seconds);
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         LAST_SOLVE.with(|slot| *slot.borrow_mut() = None);
@@ -533,8 +546,15 @@ fn run_case(case: &Case, timeout_scale: f64, max_case_seconds: Option<f64>) -> S
                     Ok(parts) => parts,
                     Err(msg) => return Status::Fail(format!("case build failed: {}", msg)),
                 };
-                problem.set_time_limit(budget);
-                let solve_result = problem.solve();
+                let solve_result = if presolve {
+                    let mut options = SolveOptions::default();
+                    options.time_limit = Some(budget);
+                    options.presolve = true;
+                    problem.solve_with(options)
+                } else {
+                    problem.set_time_limit(budget);
+                    problem.solve()
+                };
                 let details = match (&solve_result, &expected) {
                     (Ok(outcome), Expected::Objective { value, .. }) => {
                         outcome.solution().map(|sol| SolveDetails {

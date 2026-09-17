@@ -91,6 +91,7 @@ mod helpers;
 mod lu;
 mod mip;
 mod ordering;
+mod presolve;
 // Problem solvers built on top of the microlp library (not part of the
 // public API — exists only to exercise the crate's own tests).
 #[cfg(test)]
@@ -861,7 +862,7 @@ impl Solution {
         let value = self.var_value_raw(var);
         let domain = match &self.state {
             SolveState::Lp(solver) => &solver.orig_var_domains[var.0],
-            SolveState::Mip(state) => &state.solver.orig_var_domains[var.0],
+            SolveState::Mip(state) => &state.base.var_domains[var.0],
         };
         if matches!(domain, VarDomain::Integer | VarDomain::Boolean) {
             let rounded = value.round();
