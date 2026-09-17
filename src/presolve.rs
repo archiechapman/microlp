@@ -511,7 +511,9 @@ impl Presolver {
     // ---- parallel rows -----------------------------------------------------
 
     fn merge_parallel_rows(&mut self) -> Result<(), Error> {
-        let mut groups: HashMap<Vec<(usize, i64)>, Vec<(usize, f64)>> = HashMap::new();
+        // Normalised support and quantised coefficients -> (row, scale) of each member.
+        type Key = Vec<(usize, i64)>;
+        let mut groups: HashMap<Key, Vec<(usize, f64)>> = HashMap::new();
         for r in 0..self.rows.len() {
             let row = &mut self.rows[r];
             if !row.alive || row.terms.len() < 2 {
@@ -623,7 +625,7 @@ impl Presolver {
                 continue;
             }
             let score = fill * 1024 + self.cols[j].rows.len() as isize;
-            if best.map_or(true, |(_, _, s)| score < s) {
+            if best.is_none_or(|(_, _, s)| score < s) {
                 best = Some((j, q, score));
             }
         }

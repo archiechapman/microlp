@@ -20,6 +20,8 @@ impl Lcg {
     }
 }
 
+type Row = (Vec<(Variable, f64)>, ComparisonOp, f64);
+
 fn options(presolve: bool) -> SolveOptions {
     let mut options = SolveOptions::default();
     options.presolve = presolve;
@@ -195,7 +197,7 @@ fn presolve_matches_plain_solve_on_mixed_models() {
             .map(|_| problem.add_integer_var(rng.range(-4, 4) as f64, (0, rng.range(1, 4))))
             .collect();
         let mut reals = Vec::new();
-        let mut rows: Vec<(Vec<(Variable, f64)>, ComparisonOp, f64)> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         for _ in 0..rng.range(1, 4) {
             let lo = rng.range(-6, 0) as f64;
             let hi = if rng.range(0, 2) == 0 {
