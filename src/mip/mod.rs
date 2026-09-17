@@ -1523,7 +1523,10 @@ fn initialize_root(
         }
     }
 
-    state.stats.root_lp_bound = Some(to_user_space(state.direction, state.solver.cur_obj_val));
+    state.stats.root_lp_bound = Some(to_user_space(
+        state.direction,
+        state.solver.cur_obj_val + state.objective_offset(),
+    ));
 
     // Root propagation runs before the cuts, so they are derived from the tighter model.
     if state.options.propagate_rounds > 0 && !state.classifying_unbounded {
