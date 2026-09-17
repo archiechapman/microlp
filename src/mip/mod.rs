@@ -398,7 +398,19 @@ pub(crate) fn run_enumerate(
             "solve_enumerate: objective_cutoff must be finite".to_string(),
         ));
     }
-    let mut state = build_state(problem, options)?;
+    let mut state = match build_state(problem, options) {
+        // Presolve proved there is nothing to enumerate: the same certificate an
+        // exhausted tree gives.
+        Err(Error::Infeasible) => {
+            return Ok(EnumerateOutcome {
+                reason: EnumerateReason::Exhausted,
+                stats: Stats::default(),
+                lazy_rows: 0,
+                candidates: 0,
+            })
+        }
+        result => result?,
+    };
     let internal = match problem.direction {
         OptimizationDirection::Minimize => objective_cutoff,
         OptimizationDirection::Maximize => -objective_cutoff,
@@ -406,7 +418,8 @@ pub(crate) fn run_enumerate(
     // Float noise must never prune a solution that sits exactly on the cutoff.
     let slack = state.options.tolerances.prune_epsilon * internal.abs().max(1.0);
     state.enumeration = Some(Enumeration {
-        cutoff: internal + slack,
+        // The solver's objective excludes the constant presolve moved out.
+        cutoff: internal - state.objective_offset() + slack,
         lazy_rows: 0,
         candidates: 0,
         stopped: false,
@@ -874,6 +887,23 @@ fn enumerate_candidate(
             |v| state.root_bounds[v],
         ) && solver.check_constraints(&values, feasibility);
         let objective = solver.objective_of(&values);
+        // The callback sees original variables; they must pass the same validation.
+        let original = match (&state.postsolve, valid) {
+            (Some(postsolve), true) => {
+                let mut original = postsolve.values(&values);
+                for (val, dom) in original.iter_mut().zip(&state.base.var_domains) {
+                    if matches!(dom, VarDomain::Integer | VarDomain::Boolean)
+                        && (*val - val.round()).abs() <= state.options.tolerances.integrality_rounding
+                    {
+                        *val = val.round();
+                    }
+                }
+                incumbent_feasible(&state.base, &state.fixed, &original, &state.options.tolerances)
+                    .then_some(original)
+            }
+            _ => valid.then(|| values.clone()),
+        };
+        let valid = original.is_some();
         if !valid || !objective.is_finite() || objective > cutoff {
             // Rounding moved the point (infeasible or beyond the cutoff): resolve the
             // below-tolerance fractionality by branching, as the normal search does.
@@ -932,10 +962,10 @@ fn enumerate_candidate(
             continue;
         }
 
+        let user_objective = to_user_space(state.direction, objective + state.objective_offset());
         let enumeration = state.enumeration.as_mut().expect("enumeration run");
         enumeration.candidates += 1;
-        let user_objective = to_user_space(state.direction, objective);
-        let rows = match on_candidate(&values, user_objective) {
+        let rows = match on_candidate(original.as_deref().expect("validated"), user_objective) {
             CandidateAction::Stop => {
                 enumeration.stopped = true;
                 return Ok(IntegralCandidate::Stop);
@@ -946,7 +976,22 @@ fn enumerate_candidate(
         let num_vars = state.solver.num_vars;
         let mut prepared = Vec::with_capacity(rows.len());
         for (expr, op, rhs) in rows {
-            let coeffs = crate::CsVec::new_from_unsorted(num_vars, expr.vars, expr.coeffs)
+            let (vars, coeffs, rhs) = match &state.postsolve {
+                None => (expr.vars, expr.coeffs, rhs),
+                Some(postsolve) => {
+                    let terms: Vec<(usize, f64)> =
+                        expr.vars.iter().copied().zip(expr.coeffs.iter().copied()).collect();
+                    if terms.iter().any(|&(v, _)| v >= state.base.obj_coeffs.len()) {
+                        return Err(Error::InvalidOperation(
+                            "solve_enumerate: row references an unknown variable".to_string(),
+                        ));
+                    }
+                    let (terms, rhs) = postsolve.forward_row(&terms, rhs);
+                    let (vars, coeffs) = terms.into_iter().unzip();
+                    (vars, coeffs, rhs)
+                }
+            };
+            let coeffs = crate::CsVec::new_from_unsorted(num_vars, vars, coeffs)
                 .map_err(|error| Error::InvalidOperation(error.2.to_string()))?;
             prepared.push((coeffs, op, rhs));
         }
