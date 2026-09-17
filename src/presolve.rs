@@ -137,6 +137,20 @@ struct Activity {
     mag: f64,
 }
 
+/// How often each reduction fired, for the debug log.
+#[derive(Debug, Default)]
+struct Counts {
+    empty_rows: usize,
+    singleton_rows: usize,
+    redundant_rows: usize,
+    forcing_rows: usize,
+    fixed_cols: usize,
+    empty_cols: usize,
+    parallel_rows: usize,
+    doubletons: usize,
+    substitutions: usize,
+}
+
 struct Presolver {
     rows: Vec<Row>,
     cols: Vec<Col>,
@@ -145,6 +159,7 @@ struct Presolver {
     feas_tol: f64,
     int_tol: f64,
     changed: bool,
+    counts: Counts,
 }
 
 /// Presolve `problem`. Returns [`Error::Infeasible`] when a reduction proves
@@ -192,6 +207,7 @@ pub(crate) fn presolve(problem: &Problem, feas_tol: f64, int_tol: f64) -> Result
         feas_tol,
         int_tol,
         changed: false,
+        counts: Counts::default(),
     };
     p.run()?;
     // The pass limit can stop the loop with rows that were never re-checked.
@@ -201,14 +217,16 @@ pub(crate) fn presolve(problem: &Problem, feas_tol: f64, int_tol: f64) -> Result
     {
         return Err(Error::Infeasible);
     }
+    let counts = std::mem::take(&mut p.counts);
     let presolved = p.finish(problem.direction);
     debug!(
-        "presolve: {} rows x {} cols -> {} x {}, {} eliminations",
+        "presolve: {} rows x {} cols -> {} x {}, {} eliminations; {:?}",
         problem.constraints.len(),
         n,
         presolved.problem.constraints.len(),
         presolved.problem.obj_coeffs.len(),
-        presolved.postsolve.ops.len()
+        presolved.postsolve.ops.len(),
+        counts
     );
     Ok(presolved)
 }
@@ -421,6 +439,7 @@ impl Presolver {
                 if lo > self.feas_tol || hi < -self.feas_tol {
                     return Err(Error::Infeasible);
                 }
+                self.counts.empty_rows += 1;
                 self.remove_row(r);
                 return Ok(());
             }
@@ -431,6 +450,7 @@ impl Presolver {
                 } else {
                     (hi / a, lo / a)
                 };
+                self.counts.singleton_rows += 1;
                 self.remove_row(r);
                 return self.tighten(c, blo, bhi);
             }
@@ -448,6 +468,7 @@ impl Presolver {
         let forcing_high = act.max_inf == 0 && lo.is_finite() && act.max <= lo + DROP_TOL * act.mag;
         if forcing_low || forcing_high {
             let terms = self.rows[r].terms.clone();
+            self.counts.forcing_rows += 1;
             self.remove_row(r);
             for (c, a) in terms {
                 let at_lo = (a > 0.0) == forcing_low;
@@ -463,6 +484,7 @@ impl Presolver {
         let below = lo == f64::NEG_INFINITY || act.min_inf == 0 && act.min >= lo - rel_eps(lo);
         let above = hi == f64::INFINITY || act.max_inf == 0 && act.max <= hi + rel_eps(hi);
         if below && above {
+            self.counts.redundant_rows += 1;
             self.remove_row(r);
             return Ok(());
         }
@@ -498,11 +520,13 @@ impl Presolver {
     fn reduce_col(&mut self, c: usize) -> Result<(), Error> {
         let col = &self.cols[c];
         if col.lo == col.hi {
+            self.counts.fixed_cols += 1;
             self.fix_col(c, col.lo);
             return Ok(());
         }
         if col.rows.is_empty() && col.cost == 0.0 && !col.is_integer() {
             let value = 0.0f64.clamp(col.lo, col.hi);
+            self.counts.empty_cols += 1;
             self.fix_col(c, value);
         }
         Ok(())
@@ -542,10 +566,12 @@ impl Presolver {
                 }
                 let hi = hi.max(lo);
                 if (lo, hi) == (klo, khi) {
+                    self.counts.parallel_rows += 1;
                     self.remove_row(other);
                     continue;
                 }
                 if (lo, hi) == (olo, ohi) {
+                    self.counts.parallel_rows += 1;
                     self.remove_row(keep);
                     (keep, keep_scale) = (other, other_scale);
                     continue;
@@ -562,6 +588,7 @@ impl Presolver {
                     row.lo = hi * keep_scale;
                     row.hi = lo * keep_scale;
                 }
+                self.counts.parallel_rows += 1;
                 self.remove_row(other);
             }
         }
@@ -659,6 +686,11 @@ impl Presolver {
             self.tighten(x, xlo, xhi)?;
         }
 
+        if doubleton {
+            self.counts.doubletons += 1;
+        } else {
+            self.counts.substitutions += 1;
+        }
         self.remove_row(r);
         let other_rows = std::mem::take(&mut self.cols[j].rows);
         for k in other_rows {
