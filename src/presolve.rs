@@ -16,7 +16,9 @@
 //! - forcing rows (the row only holds with every variable at one bound);
 //! - integer bound tightening from row activity;
 //! - fixed columns (substituted into the rows and the objective constant);
-//! - empty columns with a zero objective coefficient (fixed inside their bounds);
+//! - empty continuous columns with a zero objective coefficient (fixed inside
+//!   their bounds; empty integer columns are kept, so distinct integer points stay
+//!   distinct);
 //! - parallel rows (merged when the result is still a one-sided or equality row);
 //! - doubleton equations `a·x + b·y = c` (eliminate `y`, move its bounds to `x`);
 //! - substitution of an implied-free column out of an equality row, with bounded
@@ -477,7 +479,7 @@ impl Presolver {
             self.fix_col(c, col.lo);
             return Ok(());
         }
-        if col.rows.is_empty() && col.cost == 0.0 {
+        if col.rows.is_empty() && col.cost == 0.0 && !col.is_integer() {
             let value = 0.0f64.clamp(col.lo, col.hi);
             self.fix_col(c, value);
         }
