@@ -1938,6 +1938,53 @@ mod tests {
     }
 
     #[test]
+    fn a_node_stopped_at_the_cutoff_still_feeds_the_pseudocosts() {
+        // minimize x s.t. 2x >= 3, x integer: the root LP is x = 1.5 (objective 1.5).
+        // With an incumbent at 2, the up child x >= 2 has LP value 2, past the cutoff, so
+        // its dual simplex stops there and the node is pruned.
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let x = p.add_integer_var(1.0, (0, 10));
+        p.add_constraint(&[(x, 2.0)], ComparisonOp::Ge, 3.0);
+        let mut state = build_state(&p, SolveOptions::default()).unwrap();
+        state.solver.initial_solve().unwrap();
+        let root_obj = state.solver.cur_obj_val;
+        assert!((root_obj - 1.5).abs() < 1e-9, "{root_obj}");
+        state.incumbent = Some(Incumbent {
+            values: vec![2.0],
+            objective: 2.0,
+        });
+        state.node_seq = 1;
+        state.last_solved_id = Some(1); // warm: the solver sits at the parent's optimum
+        let up = Node {
+            bound_changes: vec![(x.idx(), 2.0, 10.0)],
+            basis: state.solver.snapshot_basis(),
+            lp_bound: root_obj,
+            depth: 1,
+            parent_id: 1,
+            branch_var: Some(x.idx()),
+            branch_up: true,
+            branch_frac: 0.5,
+            deduced: None,
+            propagated: false,
+        };
+        let domains = state.solver.orig_var_domains.clone();
+
+        let visit = visit_node(&mut state, up, &domains, None).unwrap();
+
+        assert!(matches!(visit, NodeVisit::Solved));
+        assert_eq!(state.stats.cutoff_prunes, 1, "the child must stop at the cutoff");
+        assert_eq!(
+            state.pseudocosts.observations(x.idx()),
+            (0, 1),
+            "the up branch's gain was dropped"
+        );
+        // The gain is taken where the dual simplex stopped: 2 - 1.5 = 0.5 over a
+        // fractionality of 0.5, a lower bound on the true 1.0 per unit.
+        let est = state.pseudocosts.estimate(x.idx(), true);
+        assert!(est > 0.0 && est <= 1.0 + 1e-9, "{est}");
+    }
+
+    #[test]
     fn maximize_bound_is_in_user_space() {
         let r = run(&binary_knapsack(), SolveOptions::default()).unwrap();
         assert_eq!(r.reason, TerminationReason::ProvenOptimal);
