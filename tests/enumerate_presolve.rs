@@ -129,7 +129,8 @@ fn candidates_carry_original_objective_and_continuous_values() {
     let mut seen = Vec::new();
     let outcome = problem
         .solve_enumerate(options, 0.0, |values, objective| {
-            let expected = values[x.idx()] + values[z.idx()] + 5.0 * values[fixed.idx()] + values[y.idx()];
+            let expected =
+                values[x.idx()] + values[z.idx()] + 5.0 * values[fixed.idx()] + values[y.idx()];
             assert!((objective - expected).abs() < 1e-9);
             assert!((values[y.idx()] - (2.0 * values[x.idx()] + 0.5)).abs() < 1e-9);
             assert_eq!(values[fixed.idx()], 1.0);
