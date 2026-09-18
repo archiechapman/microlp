@@ -893,13 +893,19 @@ fn enumerate_candidate(
                 let mut original = postsolve.values(&values);
                 for (val, dom) in original.iter_mut().zip(&state.base.var_domains) {
                     if matches!(dom, VarDomain::Integer | VarDomain::Boolean)
-                        && (*val - val.round()).abs() <= state.options.tolerances.integrality_rounding
+                        && (*val - val.round()).abs()
+                            <= state.options.tolerances.integrality_rounding
                     {
                         *val = val.round();
                     }
                 }
-                incumbent_feasible(&state.base, &state.fixed, &original, &state.options.tolerances)
-                    .then_some(original)
+                incumbent_feasible(
+                    &state.base,
+                    &state.fixed,
+                    &original,
+                    &state.options.tolerances,
+                )
+                .then_some(original)
             }
             _ => valid.then(|| values.clone()),
         };
@@ -979,8 +985,12 @@ fn enumerate_candidate(
             let (vars, coeffs, rhs) = match &state.postsolve {
                 None => (expr.vars, expr.coeffs, rhs),
                 Some(postsolve) => {
-                    let terms: Vec<(usize, f64)> =
-                        expr.vars.iter().copied().zip(expr.coeffs.iter().copied()).collect();
+                    let terms: Vec<(usize, f64)> = expr
+                        .vars
+                        .iter()
+                        .copied()
+                        .zip(expr.coeffs.iter().copied())
+                        .collect();
                     if terms.iter().any(|&(v, _)| v >= state.base.obj_coeffs.len()) {
                         return Err(Error::InvalidOperation(
                             "solve_enumerate: row references an unknown variable".to_string(),
@@ -996,7 +1006,11 @@ fn enumerate_candidate(
             prepared.push((coeffs, op, rhs));
         }
         let added = state.solver.append_rows(prepared, false)?;
-        state.enumeration.as_mut().expect("enumeration run").lazy_rows += added;
+        state
+            .enumeration
+            .as_mut()
+            .expect("enumeration run")
+            .lazy_rows += added;
         if state.solver.check_constraints(&values, feasibility) {
             return Err(Error::InvalidOperation(
                 "solve_enumerate: the rows of a Reject must cut off the candidate".to_string(),
@@ -1018,8 +1032,12 @@ fn enumerate_candidate(
         }
         if !branching::is_integral(&state.solver, domains, int_tol) {
             return Ok(
-                match branching::choose_branch_var(&state.solver, domains, int_tol, &state.pseudocosts)
-                {
+                match branching::choose_branch_var(
+                    &state.solver,
+                    domains,
+                    int_tol,
+                    &state.pseudocosts,
+                ) {
                     Some(var) => IntegralCandidate::Branch(var),
                     None => IntegralCandidate::Closed,
                 },
@@ -1458,8 +1476,8 @@ fn root_cut_rounds(state: &mut MipState, domains: &[VarDomain]) -> Result<StopRe
         params::GOMORY_MIN_CUTS_PER_ROUND,
         params::GOMORY_MAX_CUTS_PER_ROUND,
     );
-    let mut budget = (rows / params::GOMORY_ROWS_PER_CUT_TOTAL)
-        .max(params::GOMORY_MIN_CUTS_PER_ROUND);
+    let mut budget =
+        (rows / params::GOMORY_ROWS_PER_CUT_TOTAL).max(params::GOMORY_MIN_CUTS_PER_ROUND);
     let mut stalled = 0;
     for round in 0..state.options.gomory_rounds {
         if budget == 0 || branching::is_integral(&state.solver, domains, int_tol) {
@@ -2088,7 +2106,10 @@ mod tests {
         let visit = visit_node(&mut state, up, &domains, None).unwrap();
 
         assert!(matches!(visit, NodeVisit::Solved));
-        assert_eq!(state.stats.cutoff_prunes, 1, "the child must stop at the cutoff");
+        assert_eq!(
+            state.stats.cutoff_prunes, 1,
+            "the child must stop at the cutoff"
+        );
         assert_eq!(
             state.pseudocosts.observations(x.idx()),
             (0, 1),
