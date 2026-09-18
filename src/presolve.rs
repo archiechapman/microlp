@@ -19,16 +19,23 @@
 //! - empty continuous columns with a zero objective coefficient (fixed inside
 //!   their bounds; empty integer columns are kept, so distinct integer points stay
 //!   distinct);
-//! - parallel rows (merged when the result is still a one-sided or equality row);
 //! - doubleton equations `a·x + b·y = c` (eliminate `y`, move its bounds to `x`);
 //! - substitution of an implied-free column out of an equality row, with bounded
 //!   fill-in (this covers free column singletons as the zero fill-in case).
 //!
 //! An integer column is only eliminated when the equality forces it to be
 //! integral, so the reduced problem keeps exactly the original integer points.
+//!
+//! Parallel rows are deliberately left alone. Merging them (keeping the tighter of
+//! two one-sided rows, or making an equality) was implemented and measured, and
+//! on the model this presolve was built for (the case118 ROP
+//! MILP) it was slower in every comparison: six same-run pairs over three builds of
+//! the search, with each LP iteration dearer every time. Unlike HiGHS's version it
+//! never needed ranged rows, so that isn't the reason, and the reason wasn't found.
+//! On the 275-case suite it changed one tree of 77 (`miplib/p0201`, 13% fewer
+//! nodes on a sub-second solve). The code is in the history at `dd276a2`.
 
 use crate::{ComparisonOp, CsVec, Error, OptimizationDirection, Problem, VarDomain};
-use std::collections::HashMap;
 
 /// Coefficients at or below this magnitude, relative to the largest magnitude
 /// they were computed from, are treated as cancelled to zero.
@@ -146,7 +153,6 @@ struct Counts {
     forcing_rows: usize,
     fixed_cols: usize,
     empty_cols: usize,
-    parallel_rows: usize,
     doubletons: usize,
     substitutions: usize,
 }
@@ -251,9 +257,6 @@ impl Presolver {
                 if self.cols[c].alive {
                     self.reduce_col(c)?;
                 }
-            }
-            if !self.changed {
-                self.merge_parallel_rows()?;
             }
             if !self.changed {
                 for r in 0..self.rows.len() {
@@ -532,93 +535,6 @@ impl Presolver {
         Ok(())
     }
 
-    // ---- parallel rows -----------------------------------------------------
-
-    fn merge_parallel_rows(&mut self) -> Result<(), Error> {
-        // Normalised support and quantised coefficients -> (row, scale) of each member.
-        type Key = Vec<(usize, i64)>;
-        let mut groups: HashMap<Key, Vec<(usize, f64)>> = HashMap::new();
-        for r in 0..self.rows.len() {
-            let row = &mut self.rows[r];
-            if !row.alive || row.terms.len() < 2 {
-                continue;
-            }
-            row.terms.sort_by_key(|&(c, _)| c);
-            let scale = row.terms[0].1;
-            let key = row
-                .terms
-                .iter()
-                .map(|&(c, a)| (c, ((a / scale) * 1e9).round() as i64))
-                .collect();
-            groups.entry(key).or_default().push((r, scale));
-        }
-        for group in groups.into_values().filter(|g| g.len() > 1) {
-            let (mut keep, mut keep_scale) = group[0];
-            for &(other, other_scale) in &group[1..] {
-                if !self.same_direction(keep, keep_scale, other, other_scale) {
-                    continue;
-                }
-                let (klo, khi) = self.normalized_range(keep, keep_scale);
-                let (olo, ohi) = self.normalized_range(other, other_scale);
-                let (lo, hi) = (klo.max(olo), khi.min(ohi));
-                if lo > hi + self.feas_tol / keep_scale.abs().min(other_scale.abs()).min(1.0) {
-                    return Err(Error::Infeasible);
-                }
-                let hi = hi.max(lo);
-                if (lo, hi) == (klo, khi) {
-                    self.counts.parallel_rows += 1;
-                    self.remove_row(other);
-                    continue;
-                }
-                if (lo, hi) == (olo, ohi) {
-                    self.counts.parallel_rows += 1;
-                    self.remove_row(keep);
-                    (keep, keep_scale) = (other, other_scale);
-                    continue;
-                }
-                if lo.is_finite() && hi.is_finite() && lo < hi {
-                    // The merge would need a ranged row; keep both.
-                    continue;
-                }
-                let row = &mut self.rows[keep];
-                if keep_scale > 0.0 {
-                    row.lo = lo * keep_scale;
-                    row.hi = hi * keep_scale;
-                } else {
-                    row.lo = hi * keep_scale;
-                    row.hi = lo * keep_scale;
-                }
-                self.counts.parallel_rows += 1;
-                self.remove_row(other);
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether two rows with the same hash key really are multiples.
-    fn same_direction(&self, r: usize, rs: f64, s: usize, ss: f64) -> bool {
-        self.rows[r].alive
-            && self.rows[s].alive
-            && self.rows[r].terms.len() == self.rows[s].terms.len()
-            && self.rows[r]
-                .terms
-                .iter()
-                .zip(&self.rows[s].terms)
-                .all(|(&(c1, a1), &(c2, a2))| {
-                    let (x, y) = (a1 / rs, a2 / ss);
-                    c1 == c2 && (x - y).abs() <= 1e-12 * x.abs().max(1.0)
-                })
-    }
-
-    fn normalized_range(&self, r: usize, scale: f64) -> (f64, f64) {
-        let row = &self.rows[r];
-        if scale > 0.0 {
-            (row.lo / scale, row.hi / scale)
-        } else {
-            (row.hi / scale, row.lo / scale)
-        }
-    }
-
     // ---- substitution ------------------------------------------------------
 
     /// Eliminate one column of equality row `r` by substitution, if a safe one
@@ -878,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_rows_merge_only_without_a_range() {
+    fn parallel_rows_are_not_merged() {
         let mut problem = Problem::new(OptimizationDirection::Minimize);
         let x = problem.add_integer_var(1.0, (0, 10));
         let y = problem.add_integer_var(1.0, (0, 10));
@@ -886,8 +802,8 @@ mod tests {
         problem.add_constraint([(x, -2.0), (y, -6.0)], ComparisonOp::Ge, -12.0);
         problem.add_constraint([(x, 3.0), (y, 9.0)], ComparisonOp::Ge, 3.0);
         let p = reduce(&problem);
-        // The two <= sides merge (x + 3y <= 6); the >= side would make a range.
-        assert_eq!(p.problem.constraints.len(), 2);
+        // Merging the two <= sides would leave 2 rows; see the module docs for why not.
+        assert_eq!(p.problem.constraints.len(), 3);
     }
 
     #[test]
