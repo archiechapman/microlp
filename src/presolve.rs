@@ -32,8 +32,8 @@
 //! MILP) it was slower in every comparison: six same-run pairs over three builds of
 //! the search, with each LP iteration dearer every time. Unlike HiGHS's version it
 //! never needed ranged rows, so that isn't the reason, and the reason wasn't found.
-//! On the 275-case suite it changed one tree of 77 (`miplib/p0201`, 13% fewer
-//! nodes on a sub-second solve). The code is in the history at `dd276a2`.
+//! On the 275-case suite it changed one tree of 77 (`miplib/p0201`: 1,981 nodes
+//! with it, 2,237 without, on a sub-second solve). The code is in the history at `dd276a2`.
 
 use crate::{ComparisonOp, CsVec, Error, OptimizationDirection, Problem, VarDomain};
 use std::cmp::Reverse;
