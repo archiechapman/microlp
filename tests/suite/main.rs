@@ -66,6 +66,7 @@ struct SolveConfig {
     strong_branch: u32,
     propagate: u32,
     no_cutoff: bool,
+    presolve: bool,
 }
 
 impl SolveConfig {
@@ -76,6 +77,7 @@ impl SolveConfig {
         options.strong_branch_reliability = self.strong_branch;
         options.propagate_rounds = self.propagate;
         options.cutoff_prune = !self.no_cutoff;
+        options.presolve = self.presolve;
         options
     }
 }
@@ -165,6 +167,7 @@ fn parse_args() -> Options {
                     .unwrap_or_else(|_| die("--propagate must be a number"));
             }
             "--no-cutoff" => opts.solve.no_cutoff = true,
+            "--presolve" => opts.solve.presolve = true,
             "--csv" => opts.csv = Some(take_value(&args, &mut i, "--csv")),
             "--easy" => raise_tier(&mut opts, Tier::Easy),
             "--medium" => raise_tier(&mut opts, Tier::Medium),
@@ -250,6 +253,7 @@ OPTIONS:
         --propagate <N> bound-propagation sweeps per node for every solve case
         --no-cutoff     solve every node LP to optimality instead of stopping it
                         once its bound passes the pruning cutoff
+        --presolve      run SolveOptions::presolve for every solve case
         --csv <PATH>    write one row per case (status, time, nodes, LP
                         iterations, cuts, strong-branch LPs) for comparing
                         search configurations across the suite's instances
