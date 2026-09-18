@@ -1510,6 +1510,18 @@ enum NodeVisit {
     Stopped,
 }
 
+/// Fold the objective gain of the branch that created `node` into its pseudocost:
+/// `objective` over the parent's bound, per unit of the parent's fractionality.
+fn record_branch_gain(state: &mut MipState, node: &Node, objective: f64) {
+    if let Some(var) = node.branch_var {
+        state.pseudocosts.record(
+            var,
+            node.branch_up,
+            (objective - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
+        );
+    }
+}
+
 /// Reconstruct and process one node selected by the outer search policy.
 fn visit_node(
     state: &mut MipState,
@@ -1558,7 +1570,16 @@ fn visit_node(
 
     let (node_lp, cut_off) = solve_node_lp_bounded(state)?;
     if cut_off {
-        // The bound passed the cutoff mid-solve: nothing here can improve on it.
+        // The bound passed the cutoff mid-solve: nothing here can improve on it. The
+        // objective where the dual simplex stopped is a valid lower bound on this child's
+        // LP value (the stop is decided on recomputed values, and the dual objective only
+        // rises), so it still says how much the branch gained, conservatively. Leaving it
+        // out starves the pseudocosts of exactly the branches that close subtrees: once the
+        // strong-branching budget is spent, a variable whose children are always cut off
+        // is never observed again, and the product rule keeps preferring variables that
+        // gain nothing (case118 "- doubleton": 33,000 nodes on one flat bound).
+        let objective = state.solver.cur_obj_val;
+        record_branch_gain(state, &node, objective);
         state.stats.cutoff_prunes += 1;
         state.last_solved_id = None;
         state.diving = false;
@@ -1580,13 +1601,7 @@ fn visit_node(
     }
 
     let objective = state.solver.cur_obj_val;
-    if let Some(var) = node.branch_var {
-        state.pseudocosts.record(
-            var,
-            node.branch_up,
-            (objective - node.lp_bound).max(0.0) / node.branch_frac.max(params::BRANCH_FRAC_GUARD),
-        );
-    }
+    record_branch_gain(state, &node, objective);
     if let Some(incumbent) = &state.incumbent {
         if objective >= cutoff(incumbent.objective, state.options.tolerances.prune_epsilon) {
             state.last_solved_id = None;
