@@ -1048,7 +1048,8 @@ impl Solver {
                              refreshing basis before declaring infeasibility",
                             iter, row,
                         );
-                        if self.refactor_repairing()? {
+                        let repaired = self.refactor_repairing()?;
+                        if repaired {
                             // A repair recomputed everything; the dual flag it set is
                             // handled at the end of this phase.
                             self.basis_repaired = false;
@@ -1056,6 +1057,24 @@ impl Solver {
                             self.recalc_basic_var_vals()?;
                         }
                         refreshed_since_pivot = true;
+                        // Re-examine THIS row on the refreshed values: if it is still
+                        // violated and still has no entering column, the declaration it
+                        // deferred stands now. Pricing afresh can pick another row
+                        // instead, and a pivot there re-arms the valve; when the refresh
+                        // keeps bringing pricing back like that, the declaration never
+                        // stands and the phase cycles forever on an infeasible LP.
+                        // A repair changes which variable each row holds, so after one
+                        // this row is no longer the deferred one: price normally.
+                        if !repaired {
+                            if let Some(new_val) = self.violated_bound(row) {
+                                self.calc_row_coeffs(row);
+                                if let Err(Error::Infeasible) =
+                                    self.choose_entering_col_dual(row, new_val)
+                                {
+                                    return Err(Error::Infeasible);
+                                }
+                            }
+                        }
                         continue;
                     }
                     Err(e) => return Err(e),
@@ -1448,6 +1467,20 @@ impl Solver {
             };
             (r, new_val)
         })
+    }
+
+    /// The bound basic row `r` would leave at if it is still violated (by the same
+    /// `EPS` test as [`Self::choose_pivot_row_dual`]), else `None`.
+    fn violated_bound(&self, r: usize) -> Option<f64> {
+        let val = self.basic_var_vals[r];
+        let (min, max) = (self.basic_var_mins[r], self.basic_var_maxs[r]);
+        if val < min - EPS {
+            Some(min)
+        } else if val > max + EPS {
+            Some(max)
+        } else {
+            None
+        }
     }
 
     /// Dual ratio test for the leaving `row`. The flag is true when a numerically tiny
@@ -2573,5 +2606,46 @@ mod tests {
         let slack = solver.slack_basis();
         solver.load_basis(&slack).unwrap();
         assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
+    }
+
+    #[test]
+    fn refresh_valve_reexamines_the_deferred_row() {
+        // min x + y, x, y >= 0, with
+        //   row 0 (A): x + y <= -1   infeasible: its slack can only rise if x or y falls
+        //   row 1 (B): x >= 5        violated by 5, and x can enter to repair it
+        // B's stored basic value is corrupted to look feasible, as round-off can leave
+        // it. Pricing then sees only A, finds no entering column, and the valve
+        // refreshes the basis, which restores B's violation. The declaration it
+        // deferred is A's, so A must be re-examined next: it is still violated with
+        // no entering column, and the LP is infeasible. Pricing afresh would pick B
+        // instead (the larger violation) and pivot x in, re-arming the valve; when
+        // the refresh keeps bringing pricing back like this, as on a case118 node LP
+        // after ~2M pivots, the phase never ends.
+        init();
+        let mut solver = Solver::try_new(
+            &[1.0, 1.0],
+            &[0.0, 0.0],
+            &[f64::INFINITY, f64::INFINITY],
+            &[
+                (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, -1.0),
+                (to_sparse(&[1.0, 0.0]), ComparisonOp::Ge, 5.0),
+            ],
+            &[VarDomain::Real, VarDomain::Real],
+            None,
+        )
+        .unwrap();
+        assert!(solver.is_dual_feasible && !solver.is_primal_feasible);
+        let row_b = match solver.var_states[solver.num_vars + 1] {
+            VarState::Basic(r) => r,
+            VarState::NonBasic(_) => panic!("slack basis expected"),
+        };
+        let (min, max) = (solver.basic_var_mins[row_b], solver.basic_var_maxs[row_b]);
+        solver.basic_var_vals[row_b] = 0.0f64.clamp(min, max);
+
+        assert_eq!(solver.restore_feasibility(), Err(Error::Infeasible));
+        assert!(
+            matches!(solver.var_states[0], VarState::NonBasic(_)),
+            "x was pivoted in after the refresh: the deferred row was not re-examined"
+        );
     }
 }
