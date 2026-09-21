@@ -570,7 +570,7 @@ computed quantity is floored at that quantity's round-off:
 | Comparison | Tolerance | Constants |
 |---|---|---|
 | Is a basic slack (row) within its bounds? | `slack_tol`: the user contract in the row's scaled units, minus the round-off of evaluating the row (`ROUNDOFF_FLOOR × (|b| + Σ|a_j x_j|)`, refreshed whenever values are recomputed or verified), floored at half that round-off. The engine uses `ROW_BUDGET_SHARE` (½) of the contract; the rest is reserved for integer rounding. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
-| Is a structural var within / at its bounds? | `structural_tol`: for a continuous var the user contract in user units; for an integer var `EPS` in user units and no looser than `EPS` in scaled units, and no looser than what its rounding may change any of its rows (`rounding_budgets`); both floored at the round-off of the bound magnitude. | `EPS = 1e-10` |
+| Is a structural var within / at its bounds? | `structural_tol`: for a continuous var the user contract in user units; for an integer var `EPS` in user units and no looser than `EPS` in scaled units. Either way, no looser than what the slack it permits may change any row the var is in (`row_budgets`: `(1 - ROW_BUDGET_SHARE)` of the contract over the var's scaled coefficient, minimised over its rows), and floored at the round-off of the bound magnitude. | `EPS = 1e-10` |
 | Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS` |
 | Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to the larger of its own terms and the row's largest entry), and at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
 | Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively or to `ENTRY_ROUNDOFF` of the computations' scale; else rebuild (stale factorization) or exclude the entry as noise (fresh one). | `PIVOT_AGREEMENT_TOL = 1e-7` |
@@ -619,11 +619,32 @@ The layering rule: the engine's tolerances decide *simplex* questions; `int_tol`
 *integrality* questions; `feasibility` is the contract presolve, the engine and *solution
 acceptance* all hold to; `prune_epsilon` decides *tree* questions.
 
+A var's tolerance is capped by its rows, and this is what keeps bound slack and row slack
+from being double-counted. The slack a var's tolerance permits does not stay with the var:
+it arrives at every row the var is in, multiplied by the coefficient. An integer var's
+rounding and a continuous var's legal excursion outside its bounds are the same quantity
+seen from two sides, so both are capped by `(1 - ROW_BUDGET_SHARE)` of the row's contract
+over the var's scaled coefficient, minimised over its rows. Capping only the integer case
+was a real bug: a continuous var could legally sit `feasibility` off its bound and, through
+a coefficient above one, push its row past the very tolerance solution acceptance then
+checked it against — so the engine rejected its own answer as an `InternalError`. Both
+`origin_feasible` and the magnitude properties found it; the counterexample is pinned as
+`property_counterexample_with_bound_slack_one_ulp_over_the_row_budget`.
+
 Known limitation: a feasible region reachable only through a pivot within the round-off
 of its row (coefficient chains spanning some twelve to fifteen orders of magnitude within
 one row and column) is beyond what `f64` can resolve; presolve does not reach it either,
 since its reductions are held to the same tolerances. Such a model is reported
-`Infeasible` or, if the pivot is taken, as a loud `InternalError`.
+`Infeasible` or, if the pivot is taken, as a loud `InternalError`. It affects pure LPs as
+much as MILPs.
+
+This limitation is *pinned by tests*, not merely described. Two exact models that trip it —
+one LP, one MILP — are committed in `src/tests/magnitudes.rs` as `#[should_panic]` tests
+named `..._is_a_known_limitation`: they pass while the limitation stands and **fail as soon
+as a change fixes it**, which is the signal to drop the attribute and keep the model as an
+ordinary regression test. The two wide-coefficient properties in `src/tests/scaling.rs` that
+search for more such models are `#[ignore]`d for the same reason (a random search cannot
+assert its own failure); run them with `cargo test --lib -- --ignored`.
 
 ---
 

@@ -92,9 +92,9 @@ pub(crate) struct Solver {
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
     /// recomputed from the multipliers.
     dual_tols: Vec<f64>,
-    /// Per structural var, its rounding budget (see [`structural_tol`]);
-    /// infinite for a continuous var. Static apart from rows added later.
-    rounding_budgets: Vec<f64>,
+    /// Per structural var, its row budget (see [`structural_tol`]); infinite
+    /// for a var in no row. Static apart from rows added later.
+    row_budgets: Vec<f64>,
 
     enable_primal_steepest_edge: bool,
     enable_dual_steepest_edge: bool,
@@ -263,13 +263,11 @@ impl Solver {
         }
         let is_integer =
             |domain: &VarDomain| matches!(domain, VarDomain::Integer | VarDomain::Boolean);
-        let mut rounding_budgets = vec![f64::INFINITY; num_vars];
+        let mut row_budgets = vec![f64::INFINITY; num_vars];
         for row in &prepared_rows {
             for (var, &coeff) in row.coeffs.iter() {
-                if is_integer(&var_domains[var]) {
-                    rounding_budgets[var] = rounding_budgets[var]
-                        .min((1.0 - ROW_BUDGET_SHARE) * feasibility * row.row_scale / coeff.abs());
-                }
+                row_budgets[var] = row_budgets[var]
+                    .min((1.0 - ROW_BUDGET_SHARE) * feasibility * row.row_scale / coeff.abs());
             }
         }
         let mut var_tols: Vec<f64> = (0..num_vars)
@@ -281,7 +279,7 @@ impl Solver {
                     orig_var_maxs[v],
                     if integer { EPS } else { feasibility },
                     integer,
-                    rounding_budgets[v],
+                    row_budgets[v],
                 )
             })
             .collect();
@@ -472,7 +470,7 @@ impl Solver {
             feasibility,
             var_tols,
             dual_tols,
-            rounding_budgets,
+            row_budgets,
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
@@ -526,9 +524,25 @@ impl Solver {
 
     /// A var's current value in user units.
     pub(crate) fn get_value(&self, var: usize) -> f64 {
-        let internal = match self.var_states[var] {
-            VarState::Basic(idx) => self.basic_var_vals[idx],
-            VarState::NonBasic(idx) => self.nb_var_vals[idx],
+        // A FIXED structural var's value is given by its bounds, not computed
+        // from the basis. The simplex prices such a var out, but one that is
+        // basic (from the initial basis or a warm start) still gets its value
+        // from `B^-1 (b - N x_N)` and may drift within its tolerance. Reporting
+        // that drift breaks an invariant the rest of the crate rests on: a
+        // fixed var is EXACT. Presolve drops a row and substitutes a fixed var
+        // out of the rows it keeps on exactly that basis (see its module docs),
+        // so a dropped row is justified only if the value really is the bound —
+        // otherwise the row it removed is violated by the coefficient times the
+        // drift, in a model the user still has the row for. The bound is also
+        // the more accurate answer: nothing about it was ever in question.
+        let fixed = var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var];
+        let internal = if fixed {
+            self.orig_var_mins[var]
+        } else {
+            match self.var_states[var] {
+                VarState::Basic(idx) => self.basic_var_vals[idx],
+                VarState::NonBasic(idx) => self.nb_var_vals[idx],
+            }
         };
         internal * self.col_scale(var)
     }
@@ -712,7 +726,7 @@ impl Solver {
             );
             let contract = if integer { EPS } else { self.feasibility };
             self.var_tols[var] =
-                structural_tol(s, min, max, contract, integer, self.rounding_budgets[var]);
+                structural_tol(s, min, max, contract, integer, self.row_budgets[var]);
         }
         let tol = self.var_tols[var];
         match self.var_states[var] {
@@ -1532,21 +1546,20 @@ impl Solver {
         self.var_tols
             .push(slack_tol(self.feasibility, row_scale, magnitude));
         for (var, &coeff) in coeffs.iter() {
-            if var < self.num_vars
-                && matches!(
-                    self.orig_var_domains[var],
-                    VarDomain::Integer | VarDomain::Boolean
-                )
-            {
+            if var < self.num_vars {
                 let budget = (1.0 - ROW_BUDGET_SHARE) * self.feasibility * row_scale / coeff.abs();
-                if budget < self.rounding_budgets[var] {
-                    self.rounding_budgets[var] = budget;
+                if budget < self.row_budgets[var] {
+                    self.row_budgets[var] = budget;
+                    let integer = matches!(
+                        self.orig_var_domains[var],
+                        VarDomain::Integer | VarDomain::Boolean
+                    );
                     self.var_tols[var] = structural_tol(
                         self.col_scales[var],
                         self.orig_var_mins[var],
                         self.orig_var_maxs[var],
-                        EPS,
-                        true,
+                        if integer { EPS } else { self.feasibility },
+                        integer,
                         budget,
                     );
                 }

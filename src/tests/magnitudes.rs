@@ -4,7 +4,14 @@
 //! every row within the documented tolerance, and every bound is finite, so
 //! `solve()` must return an optimal solution whose rows hold within that
 //! tolerance and whose objective is no worse than at `x*` — the contract in
-//! `oracle.rs`. All but the first fail today.
+//! `oracle.rs`.
+//!
+//! The fixtures pass, except the three at the end marked KNOWN LIMITATION,
+//! which are `#[should_panic]`: they record an answer the engine gets wrong
+//! today, so that fixing it shows up as a FAILING test rather than passing
+//! unnoticed. When one fails, delete its attribute — the body already asserts
+//! the right answer — and it becomes an ordinary regression test. See §7 of
+//! `ARCHITECTURE.md` for the two mechanisms behind them.
 
 #[cfg(test)]
 mod regression_tests {
@@ -280,5 +287,115 @@ mod regression_tests {
             (objective - 1e11).abs() <= 1e-6 * 1e11,
             "objective {objective:e}, expected 1e11 (x is bounded by the 1e-11 coefficient)"
         );
+    }
+
+    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7). `x0` is pinned to `2^28` by an
+    /// equality whose other coefficient is `1e-7`, so one row's terms span
+    /// fifteen orders of magnitude. `x* = [268435456, 0]` satisfies both rows
+    /// exactly, and every bound is finite — yet `solve()` answers `Infeasible`.
+    ///
+    /// Found by the wide-coefficient LP property in `scaling.rs`. It is
+    /// committed here because that property's counterexamples otherwise live
+    /// only in the gitignored `.hegel/` corpus, and because the property is a
+    /// random search: it finds this model rarely, whereas this test is exact.
+    ///
+    /// `#[should_panic]` records today's behaviour. The test is green while the
+    /// limitation stands and turns RED the moment a change fixes it — then
+    /// delete the attribute, since the body already asserts the right answer.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible on a feasible, bounded model")]
+    fn wide_coefficients_pinning_a_variable_at_2e8_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![real(0.0, 268435455.0, 268435456.0), real(0.0, 0.0, 0.25)],
+            rows: vec![
+                row(&[(0, -1.0), (1, -1e-7)], ComparisonOp::Eq, -268435456.0),
+                row(&[(1, -1.0)], ComparisonOp::Eq, -0.0),
+            ],
+            xstar: vec![268435456.0, 0.0],
+        });
+    }
+
+    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7), the mixed-integer form of the
+    /// same weakness. Five variables (one integer, two fixed) under three rows
+    /// whose coefficients run from `1e-8` to `1e4`; `x* = 0` satisfies all three
+    /// exactly, yet `solve()` answers `Infeasible`.
+    ///
+    /// Found by the wide-coefficient MILP property in `scaling.rs`; same
+    /// `#[should_panic]` contract as the test above.
+    #[test]
+    #[should_panic(expected = "solve() returned Infeasible on a feasible, bounded model")]
+    fn wide_coefficients_with_an_integer_variable_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(0.0, 0, 0),
+                real(0.0, 0.0, 0.0),
+                real(0.0, -1000001.0, 0.0),
+                real(0.0, 0.0, 1.0),
+                real(0.0, -1.0, 1.0),
+            ],
+            rows: vec![
+                row(&[(3, 1000.0), (4, 1.0)], ComparisonOp::Eq, 0.0),
+                row(&[(2, -1.0), (4, -1e-5)], ComparisonOp::Ge, -0.0),
+                row(
+                    &[(2, 1e-6), (3, -1e-8), (4, 10000.0)],
+                    ComparisonOp::Eq,
+                    0.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 0.0, 0.0],
+        });
+    }
+
+    /// KNOWN LIMITATION, and a *third* mechanism, distinct from both wide-
+    /// coefficient models above: here the engine finds an exactly integral
+    /// solution and its own feasibility guard then rejects it, so the answer is
+    /// a loud `InternalError` rather than a wrong number (§5.4, §8).
+    ///
+    /// Variable magnitudes are around `8e6` and row 1's terms reach `1.3e8`, so
+    /// the rows are consistent only to their own round-off, while the guard
+    /// re-checks the candidate against the original rows. Found by the
+    /// narrow-coefficient MILP property in `scaling.rs`.
+    ///
+    /// Verified by A/B to predate the row-budget and fixed-var-exactness fixes:
+    /// it reproduces identically with those reverted, so it is an older bug the
+    /// generator has only now reached, not a regression from them.
+    ///
+    /// Same `#[should_panic]` contract as the tests above: green while the
+    /// limitation stands, RED as soon as a change fixes it.
+    #[test]
+    #[should_panic(expected = "exactly integral solution failed feasibility validation")]
+    fn exactly_integral_candidate_rejected_at_1e8_is_a_known_limitation() {
+        check(Model {
+            direction: OptimizationDirection::Maximize,
+            vars: vec![
+                int(-1.0, 0, 0),
+                real(-1.0, 0.0, 0.0),
+                real(1.0, 0.0, 68282.0),
+                real(1.0, 7962362.0, 8516698.0),
+                real(-1.0, 0.0, 0.0),
+                real(0.0, -1.0, 0.0),
+            ],
+            rows: vec![
+                row(&[(3, 1.0), (5, -1.0)], ComparisonOp::Ge, 7962362.0),
+                row(
+                    &[(2, -0.1), (3, -16.25), (5, 1.0)],
+                    ComparisonOp::Ge,
+                    -129648946.5,
+                ),
+                row(
+                    &[(2, -0.5), (3, 0.15000000000000002), (5, -20.0)],
+                    ComparisonOp::Eq,
+                    1194354.3000000003,
+                ),
+                row(
+                    &[(2, 1.0), (3, -1.0), (5, -1.0)],
+                    ComparisonOp::Le,
+                    -7962362.0,
+                ),
+            ],
+            xstar: vec![0.0, 0.0, 0.0, 7962362.0, 0.0, 0.0],
+        });
     }
 }

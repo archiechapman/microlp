@@ -85,28 +85,40 @@ pub(crate) fn row_tolerance(tol: f64, magnitude: f64) -> f64 {
 /// order one, `EPS` in scaled units keeps that change below the rows'
 /// tolerances whatever the user-unit coefficient is.
 ///
-/// `rounding_budget` bounds an integer var's tolerance by what its rounding
-/// may change any row it is in: the row tolerance not used by the engine
-/// (`(1 - ROW_BUDGET_SHARE)` of the contract) divided by the var's scaled
-/// coefficient, minimised over its rows (infinite for a continuous var).
+/// `row_budget` bounds EVERY var's tolerance by what the slack that tolerance
+/// permits may change any row the var is in: the row tolerance not used by the
+/// engine (`(1 - ROW_BUDGET_SHARE)` of the contract) divided by the var's
+/// scaled coefficient, minimised over its rows (infinite for a var in no row).
+///
+/// The two kinds of slack it pays for are the same quantity seen from two
+/// sides. An integer var's value is ROUNDED by the MIP layer, moving every row
+/// it is in by the coefficient times the rounding. A continuous var is allowed
+/// to sit `tol` outside its bounds by [`super::Solver::first_violated_bound`],
+/// which moves every row it is in by the coefficient times that slack. Either
+/// way the row must still meet the contract afterwards, so either way the var's
+/// tolerance is capped by what its rows can absorb. Capping only the integer
+/// case let a continuous var legally sit `feasibility` off its bound and push a
+/// row with a coefficient above one past the very tolerance the guard then
+/// checked it against — the engine rejecting its own answer as an
+/// `InternalError`.
 pub(crate) fn structural_tol(
     scale: f64,
     min: f64,
     max: f64,
     contract: f64,
     integer: bool,
-    rounding_budget: f64,
+    row_budget: f64,
 ) -> f64 {
     let magnitude = [min.abs(), max.abs()]
         .into_iter()
         .filter(|m| m.is_finite())
         .fold(0.0, f64::max);
     let base = if integer {
-        (contract / scale.max(1.0)).min(rounding_budget)
+        contract / scale.max(1.0)
     } else {
         contract / scale
     };
-    base.max(ROUNDOFF_FLOOR * magnitude)
+    base.min(row_budget).max(ROUNDOFF_FLOOR * magnitude)
 }
 
 /// Tolerance within which a row's slack counts as at or within its bounds:
