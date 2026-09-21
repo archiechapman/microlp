@@ -61,7 +61,9 @@
 //!   exactly as the engine treats it.
 //! * A row becomes bounds only where a bound describes it at least as well
 //!   as the engine would hold the row: forcing rows are judged over the
-//!   EMITTED bounds and fix vars at those exact values; a singleton row is
+//!   EMITTED bounds, only when every term's range is resolvable above the
+//!   row's round-off (a term below it is invisible to the row and cannot be
+//!   forced), and fix vars at those exact values; a singleton row is
 //!   converted only when the engine's bound tolerance keeps the row within
 //!   its budget, or when it fixes the var (a fixed var is exact); and a
 //!   conversion is skipped when the round-off it moves into the var,

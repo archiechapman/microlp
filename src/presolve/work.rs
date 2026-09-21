@@ -134,6 +134,20 @@ impl Work<'_> {
         })
     }
 
+    /// Whether every term of a forcing candidate can be told apart from the
+    /// row's round-off: a var whose whole term range `|a|·(hi − lo)` lies
+    /// below the sliver plus the round-off of the sum is invisible to the
+    /// row — the corner meets the bound with the var anywhere in its range —
+    /// so the row forces nothing about it and must not fix it. (A `1e-7`
+    /// coefficient on a row of magnitude `2^28`, whose round-off is `5e-6`,
+    /// pinned a var with a range of `0.25` at its extreme and made a
+    /// feasible model infeasible.)
+    fn terms_resolvable(&self, row: &Row, sliver: f64, magnitude: f64) -> bool {
+        row.vars.iter().zip(&row.coeffs).all(|(&v, &a)| {
+            a.abs() * (self.ehi[v] - self.elo[v]) > sliver.max(0.0) + ROUNDOFF_FLOOR * magnitude
+        })
+    }
+
     /// Requeue one row (bound of one of its vars, or its own data, changed).
     fn mark_row(&mut self, r: usize) {
         if !self.dirty[r] {
@@ -496,6 +510,7 @@ impl Work<'_> {
                     if sliver <= ROUNDOFF_FLOOR * mag
                         && -sliver <= self.budget(mag)
                         && self.sliver_within_budget(rows, r, sliver)
+                        && self.terms_resolvable(row, sliver, mag)
                     {
                         let at: Vec<(usize, f64)> = row
                             .vars
@@ -520,6 +535,7 @@ impl Work<'_> {
                     if sliver <= ROUNDOFF_FLOOR * mag
                         && -sliver <= self.budget(mag)
                         && self.sliver_within_budget(rows, r, sliver)
+                        && self.terms_resolvable(row, sliver, mag)
                     {
                         let at: Vec<(usize, f64)> = row
                             .vars

@@ -6,12 +6,15 @@
 //! tolerance and whose objective is no worse than at `x*` — the contract in
 //! `oracle.rs`.
 //!
-//! The fixtures pass, except the three at the end marked KNOWN LIMITATION,
-//! which are `#[should_panic]`: they record an answer the engine gets wrong
-//! today, so that fixing it shows up as a FAILING test rather than passing
-//! unnoticed. When one fails, delete its attribute — the body already asserts
-//! the right answer — and it becomes an ordinary regression test. See §7 of
-//! `ARCHITECTURE.md` for the two mechanisms behind them.
+//! The fixtures pass, except the one marked KNOWN LIMITATION, which is
+//! `#[should_panic]`: it records an answer the engine gets wrong today, so
+//! that fixing it shows up as a FAILING test rather than passing unnoticed.
+//! When it fails, delete the attribute — the body already asserts the right
+//! answer — and it becomes an ordinary regression test. See §7 of
+//! `ARCHITECTURE.md` for the mechanism behind it. Two more fixtures were
+//! pinned the same way when they were found and turned out to be ordinary
+//! bugs (a presolve forcing rule and a skipped verification); they are plain
+//! regression tests now, which is exactly what the convention is for.
 
 #[cfg(test)]
 mod regression_tests {
@@ -289,22 +292,23 @@ mod regression_tests {
         );
     }
 
-    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7). `x0` is pinned to `2^28` by an
-    /// equality whose other coefficient is `1e-7`, so one row's terms span
-    /// fifteen orders of magnitude. `x* = [268435456, 0]` satisfies both rows
-    /// exactly, and every bound is finite — yet `solve()` answers `Infeasible`.
+    /// `x0` is pinned to `2^28` by an equality whose other coefficient is
+    /// `1e-7`, so one row's terms span fifteen orders of magnitude, and
+    /// `x* = [268435456, 0]` satisfies both rows exactly.
     ///
-    /// Found by the wide-coefficient LP property in `scaling.rs`. It is
-    /// committed here because that property's counterexamples otherwise live
-    /// only in the gitignored `.hegel/` corpus, and because the property is a
-    /// random search: it finds this model rarely, whereas this test is exact.
+    /// Once pinned as a known limitation, this was a presolve bug: the row's
+    /// round-off is `5e-6` while `x1`'s whole term range is `2.5e-8`, so the
+    /// minimum activity equals the bound to round-off wherever `x1` sits. The
+    /// forcing rule read that as "every var at its extreme" and fixed `x1` at
+    /// `0.25`, which made row 1 (`-x1 = 0`) inconsistent; the engine solves
+    /// the model exactly with presolve off. Forcing now requires every term
+    /// to be resolvable above the row's round-off (`Work::terms_resolvable`).
     ///
-    /// `#[should_panic]` records today's behaviour. The test is green while the
-    /// limitation stands and turns RED the moment a change fixes it — then
-    /// delete the attribute, since the body already asserts the right answer.
+    /// Found by the wide-coefficient LP property in `scaling.rs`; committed
+    /// here because that property's counterexamples otherwise live only in
+    /// the gitignored `.hegel/` corpus.
     #[test]
-    #[should_panic(expected = "solve() returned Infeasible on a feasible, bounded model")]
-    fn wide_coefficients_pinning_a_variable_at_2e8_is_a_known_limitation() {
+    fn wide_coefficients_pinning_a_variable_at_2e8() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![real(0.0, 268435455.0, 268435456.0), real(0.0, 0.0, 0.25)],
@@ -316,13 +320,21 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7), the mixed-integer form of the
-    /// same weakness. Five variables (one integer, two fixed) under three rows
-    /// whose coefficients run from `1e-8` to `1e4`; `x* = 0` satisfies all three
-    /// exactly, yet `solve()` answers `Infeasible`.
+    /// KNOWN LIMITATION (`ARCHITECTURE.md` §7). Five variables (one integer,
+    /// two fixed) under three rows whose coefficients run from `1e-8` to
+    /// `1e4`; `x* = 0` satisfies all three exactly, yet `solve()` answers
+    /// `Infeasible`, with presolve on or off. The start puts `x2` at its
+    /// lower bound `-1e6`, and the only tableau entry that could carry it back
+    /// to `0` is `1.5e-15` against a row maximum of `1.95`: eight ulps,
+    /// indistinguishable from round-off, so the ratio test rightly refuses
+    /// it. A bound-flipping ratio test would take the flip instead. The
+    /// integer var plays no part; the limit is the LP engine's.
     ///
-    /// Found by the wide-coefficient MILP property in `scaling.rs`; same
-    /// `#[should_panic]` contract as the test above.
+    /// Found by the wide-coefficient MILP property in `scaling.rs`.
+    /// `#[should_panic]` records today's behaviour: the test is green while
+    /// the limitation stands and turns RED the moment a change fixes it —
+    /// then delete the attribute, since the body already asserts the right
+    /// answer.
     #[test]
     #[should_panic(expected = "solve() returned Infeasible on a feasible, bounded model")]
     fn wide_coefficients_with_an_integer_variable_is_a_known_limitation() {
@@ -348,25 +360,20 @@ mod regression_tests {
         });
     }
 
-    /// KNOWN LIMITATION, and a *third* mechanism, distinct from both wide-
-    /// coefficient models above: here the engine finds an exactly integral
-    /// solution and its own feasibility guard then rejects it, so the answer is
-    /// a loud `InternalError` rather than a wrong number (§5.4, §8).
+    /// Variable magnitudes are around `8e6` and row 1's terms reach `1.3e8`.
+    /// The exactly integral optimum the engine finds must be reported, not
+    /// rejected by its own feasibility guard as an `InternalError`.
     ///
-    /// Variable magnitudes are around `8e6` and row 1's terms reach `1.3e8`, so
-    /// the rows are consistent only to their own round-off, while the guard
-    /// re-checks the candidate against the original rows. Found by the
-    /// narrow-coefficient MILP property in `scaling.rs`.
-    ///
-    /// Verified by A/B to predate the row-budget and fixed-var-exactness fixes:
-    /// it reproduces identically with those reverted, so it is an older bug the
-    /// generator has only now reached, not a regression from them.
-    ///
-    /// Same `#[should_panic]` contract as the tests above: green while the
-    /// limitation stands, RED as soon as a change fixes it.
+    /// Once pinned as a known limitation, this was a bookkeeping bug in the
+    /// verified termination: the sixth dual pivot filled the eta file, the
+    /// periodic refactorization recomputed the basic values, and the
+    /// recompute marked them verified. `verify_primal` then skipped its
+    /// residual check although the recomputed values missed row 2 by four
+    /// times its tolerance, and the guard caught what verification should
+    /// have refined. A recompute no longer counts as a verification. Found
+    /// by the narrow-coefficient MILP property in `scaling.rs`.
     #[test]
-    #[should_panic(expected = "exactly integral solution failed feasibility validation")]
-    fn exactly_integral_candidate_rejected_at_1e8_is_a_known_limitation() {
+    fn exactly_integral_optimum_at_1e8_is_verified_before_it_is_reported() {
         check(Model {
             direction: OptimizationDirection::Maximize,
             vars: vec![

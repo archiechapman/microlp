@@ -451,3 +451,41 @@ fn infinite_rhs_le_row_is_dropped_not_crashed() {
     let pre = run_lp(&[0.0, 0.0], &[1.0, 1.0], &cons).unwrap();
     assert!(pre.constraints.is_empty());
 }
+
+#[test]
+fn forcing_row_is_not_applied_to_a_term_below_its_roundoff() {
+    // -x0 - 1e-7·x1 = -2^28 with x0 in [2^28 - 1, 2^28] and x1 in [0, 0.25]:
+    // the minimum activity equals the bound to round-off (the row's round-off
+    // is 5e-6, x1's whole term range is 2.5e-8), so the row looks forcing
+    // wherever x1 sits. It forces nothing about x1, and fixing x1 at its
+    // extreme 0.25 made the second row (-x1 = 0) inconsistent: a feasible
+    // model declared Infeasible by presolve alone.
+    let big = 268435456.0; // 2^28
+    let cons = vec![
+        (csvec(2, &[(0, -1.0), (1, -1e-7)]), ComparisonOp::Eq, -big),
+        (csvec(2, &[(1, -1.0)]), ComparisonOp::Eq, -0.0),
+    ];
+    let pre = run_lp(&[big - 1.0, 0.0], &[big, 0.25], &cons).unwrap();
+    assert_eq!(
+        (pre.var_mins[1], pre.var_maxs[1]),
+        (0.0, 0.0),
+        "x1 is fixed by its own row"
+    );
+    assert_eq!(
+        (pre.var_mins[0], pre.var_maxs[0]),
+        (big, big),
+        "x0 follows from the equality"
+    );
+
+    // Control: the same shape with a resolvable second term is forcing and
+    // fixes both vars at the corner.
+    let cons = vec![(
+        csvec(2, &[(0, -1.0), (1, -1.0)]),
+        ComparisonOp::Eq,
+        -(big + 0.25),
+    )];
+    let pre = run_lp(&[big - 1.0, 0.0], &[big, 0.25], &cons).unwrap();
+    assert_eq!((pre.var_mins[0], pre.var_maxs[0]), (big, big));
+    assert_eq!((pre.var_mins[1], pre.var_maxs[1]), (0.25, 0.25));
+    assert!(pre.constraints.is_empty(), "a forcing row is dropped");
+}

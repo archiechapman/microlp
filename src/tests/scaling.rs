@@ -233,42 +233,25 @@ mod tests_scaling {
         check_with_objective(&model.0);
     }
 
-    // KNOWN LIMITATION (`ARCHITECTURE.md` §7): the wide regime reaches models the
-    // engine cannot resolve in f64, so this property finds counterexamples on some
-    // draws. Ignored rather than `#[should_panic]` because it is a random search:
-    // most runs pass, so asserting failure would itself be flaky. The two models it
-    // has found are committed as exact `#[should_panic]` fixtures in `magnitudes.rs`,
-    // which are what will turn red once the limitation is fixed. Run this property
-    // with `cargo test --lib -- --ignored` to keep searching for more.
-    #[ignore = "known limitation: wide coefficients beyond f64 resolution (ARCHITECTURE §7)"]
     #[hegel::test(settings())]
     fn a_feasible_bounded_lp_with_wide_coefficients_solves(tc: hegel::TestCase) {
         let model = tc.draw(lp_wide());
         check_feasibility(&model.0);
     }
 
-    // KNOWN LIMITATION: this property still reaches models whose rows are consistent
-    // only to their own round-off at 1e8 magnitudes, where the MIP guard rejects an
-    // exactly integral candidate (see
-    // `exactly_integral_candidate_rejected_at_1e8_is_a_known_limitation` in
-    // `magnitudes.rs`, which is what turns red once that is fixed). Ignored rather
-    // than `#[should_panic]` because it is a random search: some runs pass, so
-    // asserting failure would itself be flaky. Run it with
-    // `cargo test --lib -- --ignored` to keep searching for more.
-    #[ignore = "known limitation: exactly integral candidate rejected at 1e8 magnitudes"]
     #[hegel::test(settings())]
     fn a_feasible_bounded_milp_solves_at_every_magnitude(tc: hegel::TestCase) {
         let model = tc.draw(milp_narrow());
         check_with_objective(&model.0);
     }
 
-    // KNOWN LIMITATION (`ARCHITECTURE.md` §7): the wide regime reaches models the
-    // engine cannot resolve in f64, so this property finds counterexamples on some
-    // draws. Ignored rather than `#[should_panic]` because it is a random search:
-    // most runs pass, so asserting failure would itself be flaky. The two models it
-    // has found are committed as exact `#[should_panic]` fixtures in `magnitudes.rs`,
-    // which are what will turn red once the limitation is fixed. Run this property
-    // with `cargo test --lib -- --ignored` to keep searching for more.
+    // KNOWN LIMITATION (`ARCHITECTURE.md` §7): the wide MILP regime reaches models
+    // the ratio test cannot resolve in f64, so this property finds counterexamples
+    // on some draws. Ignored rather than `#[should_panic]` because it is a random
+    // search: most runs pass, so asserting failure would itself be flaky. The model
+    // it has found is committed as an exact `#[should_panic]` fixture in
+    // `magnitudes.rs`, which is what will turn red once the limitation is fixed. Run
+    // this property with `cargo test --lib -- --ignored` to keep searching for more.
     #[ignore = "known limitation: wide coefficients beyond f64 resolution (ARCHITECTURE §7)"]
     #[hegel::test(settings())]
     fn a_feasible_bounded_milp_with_wide_coefficients_solves(tc: hegel::TestCase) {

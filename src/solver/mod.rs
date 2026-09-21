@@ -110,8 +110,10 @@ pub(crate) struct Solver {
     is_dual_feasible: bool,
 
     /// Whether the basic values have been changed incrementally (pivots,
-    /// bound shifts) since they were last recomputed or verified; when not,
-    /// a phase exit needs no residual check and no refinement.
+    /// bound shifts) since [`Self::verify_primal`] last checked them against
+    /// the rows; when not, a phase exit needs no residual check and no
+    /// refinement. A recompute through the factorization does NOT clear it:
+    /// recomputed is not verified (see [`Self::recalc_basic_var_vals`]).
     values_dirty: bool,
     /// Whether the reduced costs have been updated incrementally since they
     /// were last recomputed exactly; when not, a phase exit needs no
@@ -926,8 +928,8 @@ impl Solver {
     /// within their bounds (and sets `is_primal_feasible` accordingly).
     fn verify_primal(&mut self) -> Result<bool, Error> {
         if !self.values_dirty {
-            // Verified or recomputed values that nothing has touched since;
-            // only the bounds may have changed.
+            // Verified values that nothing has touched since; only the
+            // bounds may have changed.
             self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
             return Ok(self.is_primal_feasible);
         }
@@ -2386,7 +2388,13 @@ impl Solver {
         self.basis_solver.solve_dense_with_etas(&mut cur_vals);
         self.basic_var_vals = cur_vals;
         self.refresh_slack_tols();
-        self.values_dirty = false;
+        // Recomputed is not verified: on an ill-conditioned basis a solve
+        // through the factorization leaves a residual above the rows'
+        // tolerances, which only `verify_primal`'s refinement removes. So
+        // `values_dirty` stays as it is; clearing it here let a phase exit
+        // skip verification right after a refactorization had recomputed the
+        // values, and report a point that missed a row by four times its
+        // tolerance (the magnitude fixture at 1e8).
         self.pivots_since_drift_check = 0;
         Ok(())
     }

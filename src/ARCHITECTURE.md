@@ -595,7 +595,9 @@ reported to the user (the pure-LP solution, a MIP candidate) is polished once by
 `polished_values`: one refinement step, kept only if it stays within every bound. Periodic
 refactorization (`refactorize`) renews the factorization and, once per full basis turnover
 of pivots, checks the residuals and recomputes the values if they drifted; the eta file
-stores `1/pivot`.
+stores `1/pivot`. A recompute is not a verification: on an ill-conditioned basis a solve
+through the factorization can leave a residual above a row's tolerance, so recomputed values
+stay unverified until the next phase exit checks and, if needed, refines them.
 
 **Presolve** (`src/presolve/`, module docs) makes its decisions with the same model, in
 user units: a row is held to the engine's *budget*, `ROW_BUDGET_SHARE` of
@@ -607,8 +609,10 @@ equality (a forcing row) is judged within `ROUNDOFF_FLOOR` of the sum; a bound i
 row is relaxed by the row's budget over the coefficient, so it never cuts a point the engine
 may return — a tiny coefficient is thereby a weak witness, exactly as the engine treats it.
 A row becomes bounds only where a bound describes it at least as well as the engine would
-hold the row: forcing rows are judged over the emitted bounds and fix vars at those exact
-values, a singleton row is converted only when the engine's bound tolerance keeps the row
+hold the row: forcing rows are judged over the emitted bounds, require every term's range to
+be resolvable above the row's round-off (a term below it is invisible to the row and cannot
+be forced) and fix vars at those exact values, a singleton row is converted only when the
+engine's bound tolerance keeps the row
 within budget or when it fixes the var, and a conversion is skipped when the round-off it
 moves into the var, amplified by the var's coefficient in another row, would exceed that
 row's budget (the two rows disagree at the level of their own round-off; only the simplex,
@@ -633,18 +637,21 @@ checked it against — so the engine rejected its own answer as an `InternalErro
 
 Known limitation: a feasible region reachable only through a pivot within the round-off
 of its row (coefficient chains spanning some twelve to fifteen orders of magnitude within
-one row and column) is beyond what `f64` can resolve; presolve does not reach it either,
-since its reductions are held to the same tolerances. Such a model is reported
-`Infeasible` or, if the pivot is taken, as a loud `InternalError`. It affects pure LPs as
-much as MILPs.
+one row and column) is beyond what the ratio test can resolve in `f64`: the entry is a few
+ulps of the row's largest and is rightly refused as noise, so the model is reported
+`Infeasible`. It is a limit of the LP engine whether or not the model has integer vars; a
+bound-flipping ratio test would resolve the pinned instance.
 
-This limitation is *pinned by tests*, not merely described. Two exact models that trip it —
-one LP, one MILP — are committed in `src/tests/magnitudes.rs` as `#[should_panic]` tests
-named `..._is_a_known_limitation`: they pass while the limitation stands and **fail as soon
-as a change fixes it**, which is the signal to drop the attribute and keep the model as an
-ordinary regression test. The two wide-coefficient properties in `src/tests/scaling.rs` that
-search for more such models are `#[ignore]`d for the same reason (a random search cannot
-assert its own failure); run them with `cargo test --lib -- --ignored`.
+This limitation is *pinned by a test*, not merely described. The exact model that trips it
+is committed in `src/tests/magnitudes.rs` as a `#[should_panic]` test named
+`..._is_a_known_limitation`: it passes while the limitation stands and **fails as soon as a
+change fixes it**, which is the signal to drop the attribute and keep the model as an
+ordinary regression test. The wide-coefficient MILP property in `src/tests/scaling.rs` that
+searches for more such models is `#[ignore]`d for the same reason (a random search cannot
+assert its own failure); run it with `cargo test --lib -- --ignored`. Two models were pinned
+this way before and turned out to be bugs, which the convention exposed as designed: a
+presolve forcing rule that fixed a var its row could not resolve, and a recompute of the
+basic values that counted as a verification. Both are ordinary regression tests now.
 
 ---
 
