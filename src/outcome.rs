@@ -36,11 +36,11 @@ impl std::fmt::Debug for SolveOutcome {
 impl SolveOutcome {
     /// Wrap a finished or interrupted pure-LP engine state. A finished state
     /// is validated against the problem's own rows and bounds in user units
-    /// (the same contract [`Tolerances::feasibility`](crate::Tolerances::feasibility) documents) before it is
+    /// (the contract [`Tolerances::feasibility`](crate::Tolerances::feasibility) documents) before it is
     /// exposed as a [`Solution`]; the engine reports `Finished` only after
-    /// verifying exactly that, so a failure here is an internal
-    /// contradiction and is reported as [`Error::InternalError`] rather than
-    /// returned as an answer.
+    /// verifying the reported values through the same evaluation, so a
+    /// failure here is an internal contradiction and is reported as
+    /// [`Error::InternalError`] rather than returned as an answer.
     pub(crate) fn from_lp_stop(
         direction: OptimizationDirection,
         num_vars: usize,
@@ -50,17 +50,14 @@ impl SolveOutcome {
     ) -> Result<Self, Error> {
         match stop {
             StopReason::Finished => {
-                let mut solver = solver;
-                let lp_values = solver.polished_values();
+                let lp_values = solver.reported_values();
                 let lp_objective = solver.objective_of(&lp_values);
-                let feasibility = solver.feasibility_tolerance();
-                if let Some((var, violation)) = solver.first_violated_bound(&lp_values, feasibility)
-                {
+                if let Some((var, violation)) = solver.first_violated_bound(&lp_values) {
                     return Err(Error::InternalError(format!(
                         "LP solution violates the bounds of variable {var} by {violation:e}"
                     )));
                 }
-                if let Some((row, violation)) = solver.first_violated_row(&lp_values, feasibility) {
+                if let Some((row, violation)) = solver.first_violated_row(&lp_values) {
                     return Err(Error::InternalError(format!(
                         "LP solution violates constraint row {row} by {violation:e}"
                     )));

@@ -85,15 +85,16 @@ pub(crate) struct Solver {
     /// Per total var, the absolute tolerance (in the engine's scaled units)
     /// within which the var counts as at a bound or within its bounds:
     /// [`structural_tol`] for a structural var (refreshed when its bounds
-    /// change) and [`slack_tol`] for a slack (refreshed whenever the basic
-    /// values are recomputed, since its round-off floor depends on them).
+    /// change) and [`slack_tol`] for a slack (refreshed whenever the rows are
+    /// checked, since its round-off floor depends on the values).
     var_tols: Vec<f64>,
     /// Per total var, the tolerance within which its reduced cost counts as
     /// zero ([`dual_tol`]); refreshed whenever the reduced costs are
     /// recomputed from the multipliers.
     dual_tols: Vec<f64>,
-    /// Per structural var, its row budget (see [`structural_tol`]); infinite
-    /// for a var in no row. Static apart from rows added later.
+    /// Per structural var, the smallest [`snap_budget`] over its rows (see
+    /// [`structural_tol`]); infinite for a var in no row. Static apart from
+    /// rows added later.
     row_budgets: Vec<f64>,
 
     enable_primal_steepest_edge: bool,
@@ -263,24 +264,20 @@ impl Solver {
                 prepared_rows.push(row);
             }
         }
-        let is_integer =
-            |domain: &VarDomain| matches!(domain, VarDomain::Integer | VarDomain::Boolean);
         let mut row_budgets = vec![f64::INFINITY; num_vars];
         for row in &prepared_rows {
             for (var, &coeff) in row.coeffs.iter() {
-                row_budgets[var] = row_budgets[var]
-                    .min((1.0 - ROW_BUDGET_SHARE) * feasibility * row.row_scale / coeff.abs());
+                row_budgets[var] =
+                    row_budgets[var].min(snap_budget(feasibility, row.row_scale, coeff));
             }
         }
         let mut var_tols: Vec<f64> = (0..num_vars)
             .map(|v| {
-                let integer = is_integer(&var_domains[v]);
                 structural_tol(
                     col_scales[v],
                     orig_var_mins[v],
                     orig_var_maxs[v],
-                    if integer { EPS } else { feasibility },
-                    integer,
+                    feasibility,
                     row_budgets[v],
                 )
             })
@@ -524,29 +521,21 @@ impl Solver {
         Ok(res)
     }
 
-    /// A var's current value in user units.
+    /// A var's current value in user units: the value that is reported.
     pub(crate) fn get_value(&self, var: usize) -> f64 {
-        // A FIXED structural var's value is given by its bounds, not computed
-        // from the basis. The simplex prices such a var out, but one that is
-        // basic (from the initial basis or a warm start) still gets its value
-        // from `B^-1 (b - N x_N)` and may drift within its tolerance. Reporting
-        // that drift breaks an invariant the rest of the crate rests on: a
-        // fixed var is EXACT. Presolve drops a row and substitutes a fixed var
-        // out of the rows it keeps on exactly that basis (see its module docs),
-        // so a dropped row is justified only if the value really is the bound —
-        // otherwise the row it removed is violated by the coefficient times the
-        // drift, in a model the user still has the row for. The bound is also
-        // the more accurate answer: nothing about it was ever in question.
-        let fixed = var < self.num_vars && self.orig_var_mins[var] == self.orig_var_maxs[var];
-        let internal = if fixed {
-            self.orig_var_mins[var]
+        let internal = if var < self.num_vars {
+            self.reported_internal_value(var)
         } else {
-            match self.var_states[var] {
-                VarState::Basic(idx) => self.basic_var_vals[idx],
-                VarState::NonBasic(idx) => self.nb_var_vals[idx],
-            }
+            self.internal_value(var)
         };
         internal * self.col_scale(var)
+    }
+
+    /// The structural values to report, in user units: the point the last
+    /// verification checked, since [`Self::verify_primal`] evaluates the rows
+    /// at exactly these values.
+    pub(crate) fn reported_values(&self) -> Vec<f64> {
+        (0..self.num_vars).map(|v| self.get_value(v)).collect()
     }
 
     /// The column factor of `var`: `s_j` for a structural var, one for a slack.
@@ -559,11 +548,6 @@ impl Solver {
         }
     }
 
-    /// The user's absolute feasibility tolerance this engine holds rows to.
-    pub(crate) fn feasibility_tolerance(&self) -> f64 {
-        self.feasibility
-    }
-
     /// A var's current value in the engine's scaled units.
     #[inline]
     fn internal_value(&self, var: usize) -> f64 {
@@ -573,34 +557,56 @@ impl Solver {
         }
     }
 
-    /// The slack tolerance of row `r` at the current values (see
-    /// [`slack_tol`]).
-    fn current_slack_tol(&self, r: usize) -> f64 {
+    /// A structural var's value as it is reported, in scaled units: a FIXED
+    /// var (`lo == hi`) is reported at its bound, not at the value the basis
+    /// gives it. The simplex prices such a var out, but one that is basic
+    /// (from a warm start, or fixed by a bound change while basic) still gets
+    /// its value from `B^-1 (b - N x_N)` and may drift within its tolerance.
+    /// The rest of the crate rests on a fixed var being EXACT: presolve drops
+    /// rows and substitutes fixed vars out of the rows it keeps on that
+    /// basis. The bound is also the more accurate answer; nothing about it
+    /// was ever in question. The snap is the same move as rounding an
+    /// integer var, and [`structural_tol`] caps a fixed var's drift by what
+    /// its rows can absorb, so the reported point still meets the contract
+    /// the engine verified at the basis values ([`Self::check_rows`]). The
+    /// engine's own bookkeeping never snaps: the basis equations hold at the
+    /// basis values, and a var fixed by a bound change while basic is moved
+    /// onto its value by the dual simplex like any other bound violation.
+    #[inline]
+    fn reported_internal_value(&self, var: usize) -> f64 {
+        if self.orig_var_mins[var] == self.orig_var_maxs[var] {
+            self.orig_var_mins[var]
+        } else {
+            self.internal_value(var)
+        }
+    }
+
+    /// The activity `Σ a_rj x_j` of row `r` over the structural vars at the
+    /// scaled values `x`, and the magnitude `|b_r| + Σ|a_rj x_j|` it was
+    /// computed from. This is THE evaluation of a row: the engine derives its
+    /// basic slacks from it ([`Self::check_rows`]) and the checks at the
+    /// boundary evaluate the reported point through it, term for term in the
+    /// same order, so all of them see the same bits.
+    fn row_activity(&self, r: usize, x: impl Fn(usize) -> f64) -> (f64, f64) {
         //guaranteed to be a valid index
         let row = self.orig_constraints.outer_view(r).unwrap();
+        let mut lhs = 0.0;
         let mut magnitude = self.orig_rhs[r].abs();
         for (v, &coeff) in row.iter() {
             if v < self.num_vars {
-                magnitude += (coeff * self.internal_value(v)).abs();
+                let term = coeff * x(v);
+                lhs += term;
+                magnitude += term.abs();
             }
         }
-        slack_tol(self.feasibility, self.row_scales[r], magnitude)
+        (lhs, magnitude)
     }
 
-    /// Re-derive every slack tolerance from the rows' magnitudes at the
-    /// current values (see [`slack_tol`]). Called whenever the basic values
-    /// are recomputed.
-    fn refresh_slack_tols(&mut self) {
-        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
-            let mut magnitude = self.orig_rhs[r].abs();
-            for (v, &coeff) in row.iter() {
-                if v < self.num_vars {
-                    magnitude += (coeff * self.internal_value(v)).abs();
-                }
-            }
-            self.var_tols[self.num_vars + r] =
-                slack_tol(self.feasibility, self.row_scales[r], magnitude);
-        }
+    /// The slack tolerance of row `r` at the current values (see
+    /// [`slack_tol`]).
+    fn current_slack_tol(&self, r: usize) -> f64 {
+        let (_, magnitude) = self.row_activity(r, |v| self.internal_value(v));
+        slack_tol(self.feasibility, self.row_scales[r], magnitude)
     }
 
     /// Re-derive every reduced-cost tolerance from the magnitudes of the
@@ -618,76 +624,50 @@ impl Solver {
         }
     }
 
-    /// Check `values` (one entry per structural var, user units) against every
-    /// ORIGINAL constraint row, within the ABSOLUTE user tolerance `tol`
-    /// floored at each row's round-off (see [`row_tolerance`]). Bounds are
-    /// not checked here. Each row's sense is encoded by its slack var's bounds
-    /// (lhs + s = rhs with s in [smin, smax]  ⇔  rhs - smax ≤ lhs ≤ rhs - smin);
-    /// slack bounds are never touched by branching, so this always reflects the
-    /// user's original rows.
+    /// The first ORIGINAL row that `values` (one entry per structural var,
+    /// user units) violates beyond the contract, with the violation in user
+    /// units. A row's sense is encoded by its slack var's bounds
+    /// (`lhs + s = rhs` with `s` in `[smin, smax]`); slack bounds are never
+    /// touched by branching, so this always reflects the user's rows.
     ///
-    /// Rows carry internal power-of-two factors; the check multiplies the
-    /// user values and tolerance by the same factors, which is exactly (not
-    /// just algebraically) the check on the unscaled user row. The tolerance
-    /// is deliberately NOT relative to the row's coefficients: this check
-    /// exists for the big-M trap, where a violation that is tiny RELATIVE to
-    /// huge coefficients (e.g. 5.0 on a 1e9-scale row) is decisive in
-    /// absolute terms. The round-off floor is relative to the row's ACTIVITY
-    /// instead: what evaluating the row in `f64` can resolve at all, the same
-    /// allowance the engine's slack tolerances carry, so a point the engine
-    /// holds within tolerance is never rejected here for round-off alone.
-    pub(crate) fn first_violated_row(&self, values: &[f64], tol: f64) -> Option<(usize, f64)> {
-        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
-            let rhs = self.orig_rhs[r];
-            let mut lhs = 0.0;
-            let mut magnitude = rhs.abs();
-            for (v, &coeff) in row.iter() {
-                if v < self.num_vars {
-                    // `values` are user units; the stored column is scaled by
-                    // `s_v`, so the product `coeff * (values[v] / s_v)` is
-                    // exactly the user term times the row's factor.
-                    let term = coeff * (values[v] / self.col_scales[v]);
-                    lhs += term;
-                    magnitude += term.abs();
-                }
-            }
-            if !lhs.is_finite() {
-                return Some((r, f64::INFINITY));
-            }
+    /// This is the evaluation the engine verified before it reported the
+    /// point ([`Self::check_rows`]): the row's activity through
+    /// [`Self::row_activity`], the slack it implies, and [`outside`] against
+    /// the slack's bounds within [`row_tolerance`] of the user's absolute
+    /// tolerance in the row's scaled units. Multiplying the tolerance by the
+    /// row's power-of-two factor is exact, so this is the check on the
+    /// unscaled user row. The tolerance is deliberately NOT relative to the
+    /// row's coefficients: the big-M trap is a violation that is tiny
+    /// relative to huge coefficients (`5.0` on a `1e9`-scale row) and
+    /// decisive in absolute terms. The round-off floor is relative to the
+    /// row's ACTIVITY instead: what evaluating the row in `f64` can resolve
+    /// at all.
+    pub(crate) fn first_violated_row(&self, values: &[f64]) -> Option<(usize, f64)> {
+        for r in 0..self.num_constraints() {
+            // `values` are user units; the stored column is scaled by `s_v`,
+            // and dividing by the power of two is exact, so the product
+            // `coeff * (values[v] / s_v)` is the user term times the row's
+            // factor.
+            let (lhs, magnitude) = self.row_activity(r, |v| values[v] / self.col_scales[v]);
             let slack = self.num_vars + r;
             let (smin, smax) = (self.orig_var_mins[slack], self.orig_var_maxs[slack]);
-            let lo = if smax.is_finite() {
-                rhs - smax
-            } else {
-                f64::NEG_INFINITY
-            };
-            let hi = if smin.is_finite() {
-                rhs - smin
-            } else {
-                f64::INFINITY
-            };
-            let scaled_tol = row_tolerance(tol * self.row_scales[r], magnitude);
-            let violation = (lo - lhs).max(lhs - hi);
-            if violation > scaled_tol {
-                return Some((r, violation / self.row_scales[r]));
+            let implied = self.orig_rhs[r] - lhs;
+            let tol = row_tolerance(self.feasibility * self.row_scales[r], magnitude);
+            if outside(implied, smin, smax, tol) {
+                return Some((r, excursion(implied, smin, smax) / self.row_scales[r]));
             }
         }
         None
     }
 
     /// The first structural var whose value (user units) violates its bounds
-    /// beyond the user tolerance `tol` floored at the bound's round-off, with
-    /// the violation in user units.
-    pub(crate) fn first_violated_bound(&self, values: &[f64], tol: f64) -> Option<(usize, f64)> {
+    /// beyond the contract, the user tolerance floored at the round-off of
+    /// the bound ([`bound_tolerance`]), with the violation in user units.
+    pub(crate) fn first_violated_bound(&self, values: &[f64]) -> Option<(usize, f64)> {
         values.iter().enumerate().find_map(|(v, &x)| {
             let (lo, hi) = self.get_var_bounds(v);
-            let magnitude = [lo.abs(), hi.abs()]
-                .into_iter()
-                .filter(|m| m.is_finite())
-                .fold(0.0, f64::max);
-            let tol = row_tolerance(tol, magnitude);
-            let violation = (lo - x).max(x - hi);
-            (!x.is_finite() || violation > tol).then_some((v, violation))
+            let tol = bound_tolerance(self.feasibility, lo, hi);
+            outside(x, lo, hi, tol).then(|| (v, excursion(x, lo, hi)))
         })
     }
 
@@ -722,13 +702,8 @@ impl Solver {
         self.orig_var_mins[var] = min;
         self.orig_var_maxs[var] = max;
         if var < self.num_vars {
-            let integer = matches!(
-                self.orig_var_domains[var],
-                VarDomain::Integer | VarDomain::Boolean
-            );
-            let contract = if integer { EPS } else { self.feasibility };
             self.var_tols[var] =
-                structural_tol(s, min, max, contract, integer, self.row_budgets[var]);
+                structural_tol(s, min, max, self.feasibility, self.row_budgets[var]);
         }
         let tol = self.var_tols[var];
         match self.var_states[var] {
@@ -866,66 +841,65 @@ impl Solver {
         if self.pivots_since_drift_check >= self.num_constraints().max(1) {
             self.pivots_since_drift_check = 0;
             let mut residuals = Vec::with_capacity(self.num_constraints());
-            if !self.row_residuals(&mut residuals) {
+            if !self.check_rows(&mut residuals) {
                 self.recalc_basic_var_vals()?;
             }
         }
         Ok(())
     }
 
-    /// Residual `b - A x` of every row at the current values (all vars, slack
-    /// columns included), in the engine's scaled units, and whether every
-    /// residual is within its row's slack tolerance. The residual is exactly
-    /// the row violation the user would see, so this is the contract itself.
-    /// The slack tolerances are re-derived from the rows' magnitudes at the
-    /// current values on the way (they are otherwise only refreshed when the
-    /// values are recomputed, and a floor derived at a far-away starting
-    /// point would misjudge the residual here).
-    fn row_residuals(&mut self, residuals: &mut Vec<f64>) -> bool {
-        self.row_residuals_with_roundoff(residuals).0
-    }
-
-    /// [`Self::row_residuals`], also returning whether every residual is
-    /// within the round-off of evaluating its row, i.e. the values already
-    /// are the exact vertex as far as `f64` can tell.
-    fn row_residuals_with_roundoff(&mut self, residuals: &mut Vec<f64>) -> (bool, bool) {
+    /// Bring the rows and the values into agreement and measure what is left.
+    /// Every BASIC slack is re-derived from its row, `s = b - Σ a_j x_j` at
+    /// the current structural values, through the very evaluation the checks
+    /// at the boundary repeat ([`Self::row_activity`]): a row's violation
+    /// then lives in its slack's value, where the dual simplex sees it and
+    /// where the guard will find the same bits (up to the snap of a fixed or
+    /// integer var, which stays within the row's reserve). The slack
+    /// tolerances are refreshed from the rows' magnitudes at these values.
+    /// `residuals` receives `b - Σ a_j x_j - s` for every row: zero by
+    /// construction where the slack is basic, so it measures how far the
+    /// basic STRUCTURAL values are from solving the rows whose slack sits at
+    /// a bound. Returns whether every residual is within its row's tolerance.
+    fn check_rows(&mut self, residuals: &mut Vec<f64>) -> bool {
         residuals.clear();
-        let mut all_within = true;
-        let mut all_roundoff = true;
-        for (r, row) in self.orig_constraints.outer_iterator().enumerate() {
-            let rhs = self.orig_rhs[r];
-            let mut residual = rhs;
-            let mut magnitude = rhs.abs();
-            for (v, &coeff) in row.iter() {
-                let term = coeff * self.internal_value(v);
-                residual -= term;
-                if v < self.num_vars {
-                    magnitude += term.abs();
+        let mut hold = true;
+        for r in 0..self.num_constraints() {
+            let (lhs, magnitude) = self.row_activity(r, |v| self.internal_value(v));
+            let implied = self.orig_rhs[r] - lhs;
+            let slack = self.num_vars + r;
+            let residual = match self.var_states[slack] {
+                VarState::Basic(row) => {
+                    self.basic_var_vals[row] = implied;
+                    0.0
                 }
-            }
+                VarState::NonBasic(col) => implied - self.nb_var_vals[col],
+            };
             let tol = slack_tol(self.feasibility, self.row_scales[r], magnitude);
-            self.var_tols[self.num_vars + r] = tol;
+            self.var_tols[slack] = tol;
+            // A NaN residual holds nothing.
             if residual.is_nan() || residual.abs() > tol {
-                all_within = false;
-            }
-            if residual.is_nan() || residual.abs() > ROUNDOFF_FLOOR * magnitude {
-                all_roundoff = false;
+                hold = false;
             }
             residuals.push(residual);
         }
-        (all_within, all_roundoff)
+        hold
     }
 
-    /// Make the basic values consistent with the rows to within their
-    /// tolerances and measure primal feasibility on them. The incrementally
-    /// updated values are checked first (an O(nnz) residual); only if they
-    /// have drifted are they recomputed through the factorization, then
-    /// through a fresh factorization, then refined by one step of iterative
-    /// refinement. A residual that survives all three means the basis is too
-    /// ill-conditioned to represent its own vertex, which is reported
-    /// loudly rather than as an optimum. The objective is recomputed from the
-    /// values so it always matches them. Returns whether the values are
-    /// within their bounds (and sets `is_primal_feasible` accordingly).
+    /// Make the values satisfy the rows to within their tolerances and
+    /// measure primal feasibility on them. The rows are evaluated through
+    /// [`Self::check_rows`], the same evaluation the boundary repeats on the
+    /// reported point, so a `Finished` state and the point handed out agree
+    /// bit for bit up to the snap of fixed and integer vars. The incrementally updated
+    /// values are checked first (an O(nnz) pass); only if the basic
+    /// structural values have drifted out of the rows' tolerances are they
+    /// refined through the factorization, then through a fresh one. A
+    /// residual that survives both means the basis is too ill-conditioned to
+    /// represent its own vertex, which is reported loudly rather than as an
+    /// optimum. Values within tolerance are not refined: the contract asks no
+    /// more, and moving last bits steers the branch & bound. The objective is
+    /// recomputed from the values so it always matches them. Returns whether
+    /// the values are within their bounds (and sets `is_primal_feasible`
+    /// accordingly).
     fn verify_primal(&mut self) -> Result<bool, Error> {
         if !self.values_dirty {
             // Verified values that nothing has touched since; only the
@@ -934,126 +908,57 @@ impl Solver {
             return Ok(self.is_primal_feasible);
         }
         let mut residuals = Vec::with_capacity(self.num_constraints());
-        let (rows_hold, at_roundoff) = self.row_residuals_with_roundoff(&mut residuals);
-        if at_roundoff {
-            // Already the exact vertex to working precision: nothing to
-            // refine (the common case on well-scaled models, where the
-            // incremental updates are exact).
-            self.values_dirty = false;
-            self.cur_obj_val = self.exact_obj_val();
-            self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
-            return Ok(self.is_primal_feasible);
+        let mut hold = self.check_rows(&mut residuals);
+        if !hold {
+            hold = self.refine(&mut residuals);
         }
-        let current_feasible = rows_hold && self.calc_primal_infeasibility().0 == 0;
-        let saved = current_feasible.then(|| (self.basic_var_vals.clone(), self.var_tols.clone()));
-
-        // Iterative refinement through the current factorization: solve
-        // `B delta = residual` and correct, while the rows are out of
-        // tolerance. Unlike recomputing the values outright, the correction
-        // is accurate even through a poor eta file, because a solve's
-        // round-off scales with its right-hand side and the residual is
-        // tiny. Values within tolerance are left alone here (the contract
-        // asks no more, and refining them costs a solve per node and moves
-        // last bits that steer the branch & bound); what is reported to the
-        // user is refined once by [`Self::polished_values`].
-        let mut ok = self.refine(&mut residuals, rows_hold)?;
-        if !ok {
+        if !hold {
             debug!("verify: residual persists through the factorization; refactorizing");
             self.basis_solver
                 .reset(&self.orig_constraints_csc, &self.basic_vars)?;
             self.recalc_basic_var_vals()?;
-            let rows_hold = self.row_residuals(&mut residuals);
-            ok = self.refine(&mut residuals, rows_hold)?;
-            if !ok {
+            hold = self.check_rows(&mut residuals) || self.refine(&mut residuals);
+            if !hold {
                 return Err(Error::InternalError(
                     "basis too ill-conditioned: recomputed values do not satisfy the rows"
                         .to_string(),
                 ));
             }
         }
-
-        // The refined point is the exact vertex of the rounded data; it can
-        // carry a var onto the far side of a bound by a round-off amount the
-        // rows allow and the var's own tolerance does not (rounded data pin
-        // a var 1e-6 past its bound while its equality is satisfied to
-        // 1e-8). Then the point verified before refinement is the better
-        // representation of the vertex and is kept.
-        if let Some((vals, tols)) = saved {
-            if self.calc_primal_infeasibility().0 != 0 {
-                debug!("verify: the exact vertex leaves a bound; keeping the verified point");
-                self.basic_var_vals = vals;
-                self.var_tols = tols;
-            }
-        }
-
         self.values_dirty = false;
         self.cur_obj_val = self.exact_obj_val();
         self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
         Ok(self.is_primal_feasible)
     }
 
-    /// The structural values (user units) to report: the current ones,
-    /// refined by one step of iterative refinement when the rows are not
-    /// already satisfied to round-off, so that a verified point that drifted
-    /// by a within-tolerance amount is reported at the exact vertex (`x = 0`
-    /// rather than `-2e-9`). The refined point is used only if it is within
-    /// every bound; otherwise the exact vertex of the rounded data leaves a
-    /// bound the current point satisfies (see [`Self::verify_primal`]) and
-    /// the current point is the better answer. The engine's own state is not
-    /// changed.
-    pub(crate) fn polished_values(&mut self) -> Vec<f64> {
-        let mut residuals = Vec::with_capacity(self.num_constraints());
-        let saved_tols = self.var_tols.clone();
-        let (rows_hold, at_roundoff) = self.row_residuals_with_roundoff(&mut residuals);
-        let values = if rows_hold && !at_roundoff && residuals.iter().any(|r| *r != 0.0) {
-            let saved_vals = self.basic_var_vals.clone();
-            self.basis_solver.solve_dense_with_etas(&mut residuals);
-            for (val, delta) in self.basic_var_vals.iter_mut().zip(residuals.iter()) {
-                *val += delta;
-            }
-            let refined_feasible = self.calc_primal_infeasibility().0 == 0;
-            let values: Vec<f64> = (0..self.num_vars).map(|v| self.get_value(v)).collect();
-            self.basic_var_vals = saved_vals;
-            if refined_feasible {
-                Some(values)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        self.var_tols = saved_tols;
-        values.unwrap_or_else(|| (0..self.num_vars).map(|v| self.get_value(v)).collect())
-    }
-
-    /// Apply iterative refinement steps to the basic values given the current
-    /// `residuals` (see [`Self::verify_primal`]); returns whether the rows
-    /// hold within tolerance afterwards. `rows_hold` says whether they do
-    /// before the first step.
-    fn refine(&mut self, residuals: &mut Vec<f64>, mut rows_hold: bool) -> Result<bool, Error> {
+    /// Iterative refinement of the basic values given the current
+    /// `residuals` (see [`Self::verify_primal`]): solve `B delta = residual`
+    /// and correct, up to [`REFINEMENT_STEPS`] times or until the rows hold.
+    /// Unlike recomputing the values outright, the correction is accurate
+    /// even through a poor eta file, because a solve's round-off scales with
+    /// its right-hand side and the residual is tiny. Returns whether the
+    /// rows hold afterwards.
+    fn refine(&mut self, residuals: &mut Vec<f64>) -> bool {
         for step in 0..REFINEMENT_STEPS {
-            if rows_hold {
-                break;
-            }
-            if residuals.iter().all(|r| *r == 0.0) {
-                break;
-            }
             self.basis_solver.solve_dense_with_etas(residuals);
             for (val, delta) in self.basic_var_vals.iter_mut().zip(residuals.iter()) {
                 *val += delta;
             }
-            rows_hold = self.row_residuals(residuals);
+            let hold = self.check_rows(residuals);
             debug!(
                 "verify: refinement step {} ({})",
                 step + 1,
-                if rows_hold {
+                if hold {
                     "rows hold"
                 } else {
                     "rows still violated"
                 }
             );
+            if hold {
+                return true;
+            }
         }
-        Ok(rows_hold)
+        false
     }
 
     /// The objective of the current values under the cost vector in force
@@ -1540,31 +1445,24 @@ impl Solver {
         let mut lhs_val = 0.0;
         let mut magnitude = rhs.abs();
         for (var, &coeff) in coeffs.iter() {
-            let val = self.internal_value(var);
-            lhs_val += val * coeff;
-            magnitude += (val * coeff).abs();
+            let term = coeff * self.internal_value(var);
+            lhs_val += term;
+            magnitude += term.abs();
         }
         self.basic_var_vals.push(rhs - lhs_val);
         self.var_tols
             .push(slack_tol(self.feasibility, row_scale, magnitude));
         for (var, &coeff) in coeffs.iter() {
-            if var < self.num_vars {
-                let budget = (1.0 - ROW_BUDGET_SHARE) * self.feasibility * row_scale / coeff.abs();
-                if budget < self.row_budgets[var] {
-                    self.row_budgets[var] = budget;
-                    let integer = matches!(
-                        self.orig_var_domains[var],
-                        VarDomain::Integer | VarDomain::Boolean
-                    );
-                    self.var_tols[var] = structural_tol(
-                        self.col_scales[var],
-                        self.orig_var_mins[var],
-                        self.orig_var_maxs[var],
-                        if integer { EPS } else { self.feasibility },
-                        integer,
-                        budget,
-                    );
-                }
+            let budget = snap_budget(self.feasibility, row_scale, coeff);
+            if budget < self.row_budgets[var] {
+                self.row_budgets[var] = budget;
+                self.var_tols[var] = structural_tol(
+                    self.col_scales[var],
+                    self.orig_var_mins[var],
+                    self.orig_var_maxs[var],
+                    self.feasibility,
+                    budget,
+                );
             }
         }
         // The new slack's reduced cost is exactly zero until the multipliers
@@ -2387,7 +2285,10 @@ impl Solver {
         // does not require a full basis refactorization.
         self.basis_solver.solve_dense_with_etas(&mut cur_vals);
         self.basic_var_vals = cur_vals;
-        self.refresh_slack_tols();
+        // Basic slacks re-derived from their rows and the slack tolerances
+        // refreshed; the residuals themselves are the caller's business.
+        let mut residuals = Vec::with_capacity(self.num_constraints());
+        self.check_rows(&mut residuals);
         // Recomputed is not verified: on an ill-conditioned basis a solve
         // through the factorization leaves a residual above the rows'
         // tolerances, which only `verify_primal`'s refinement removes. So

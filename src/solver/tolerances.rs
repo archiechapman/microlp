@@ -1,24 +1,22 @@
-//! The engine's tolerance model: the constants that define it and the
-//! functions that derive a tolerance for one comparison from them.
+//! The engine's tolerance model: the one contract every layer holds a point
+//! to, and the few constants that describe what the arithmetic can resolve.
 //!
-//! Every tolerance here is *relative to a magnitude* — the size of the
-//! quantities the compared value was computed from — floored at what `f64`
-//! can resolve for that magnitude. See ARCHITECTURE §7 for the contract these
-//! implement and `super::Solver::var_tols` / `super::Solver::dual_tols` for
-//! the per-variable and per-row instances.
+//! The contract (ARCHITECTURE §7): a value may leave its range by the user's
+//! absolute `feasibility` tolerance, or by the round-off of the quantities it
+//! was computed from if that is larger. [`row_tolerance`] is that rule,
+//! [`bound_tolerance`] its instance for a var's bounds, and [`outside`] the
+//! one comparison every check makes. The engine holds each row to
+//! [`ROW_BUDGET_SHARE`] of the contract ([`slack_tol`]) and caps a var's
+//! bound tolerance by what its rows can absorb ([`structural_tol`]), so that
+//! the point it reports passes the same evaluation at the boundary (the MIP
+//! candidate guard, the pure-LP validation) with the other half to spare for
+//! a snapped integer or fixed value and for evaluating the row in another
+//! order. Everything else here is a property of `f64` and of the
+//! factorization, not of the contract.
 
-/// The engine's base absolute tolerance, in its scaled units. It is the
-/// absolute part of every tolerance below and the absolute floor of the pivot
-/// tolerances; every comparison that involves a quantity with a magnitude
-/// uses a tolerance floored at that magnitude's round-off instead of `EPS`
-/// alone (see [`super::Solver::var_tols`] and [`super::Solver::dual_tols`]).
-///
-/// Deliberately tight for structural bounds because the big-M correctness
-/// models rely on node LPs resolving basic integer values sharply onto their
-/// bounds: a basic binary sitting `1e-8` off its bound is rounded by the MIP
-/// layer, and a 1e9-scale big-M row then amplifies the rounding past the
-/// rounded-incumbent feasibility guard. Row (slack) tolerances instead carry
-/// the user's feasibility contract, see [`slack_tol`].
+/// The absolute part of the reduced-cost tolerance ([`dual_tol`]) and of
+/// [`float_eq`], in the engine's scaled units, where quantities are of order
+/// one: far above round-off, far below any decision the contract makes.
 pub const EPS: f64 = 1e-10;
 
 /// Relative round-off allowance: about a hundred ulps of `f64`. A quantity
@@ -54,94 +52,109 @@ pub(crate) const PIVOT_REL_TOL: f64 = 1e-7;
 /// noise disagrees by tens of percent.
 pub(crate) const PIVOT_AGREEMENT_TOL: f64 = 1e-7;
 
-/// Iterative refinement steps [`super::Solver::verify_primal`] may apply to values
-/// recomputed through a fresh factorization before giving up on the basis.
+/// Iterative refinement steps [`super::Solver::verify_primal`] may apply to
+/// the basic values before giving up on the current factorization.
 pub(crate) const REFINEMENT_STEPS: usize = 3;
 
 /// Upper bound on the number of primal/dual phase alternations
 /// [`super::Solver::run_phases`] performs before giving up loudly. A phase ends on
-/// values recomputed from the factorization and verified against the rows,
-/// so a second round is already rare; hitting this bound means the basis is
-/// numerically unusable, which must not be reported as an optimum.
+/// values verified against the rows, so a second round is already rare;
+/// hitting this bound means the basis is numerically unusable, which must
+/// not be reported as an optimum.
 pub(crate) const MAX_PHASE_ROUNDS: usize = 8;
 
-/// The tolerance a row of magnitude `magnitude` (`|b| + sum |a_j x_j|`) is
-/// held to under an absolute tolerance `tol`: `tol` itself, but never finer
-/// than the round-off of evaluating the row. Shared by the engine's slack
-/// tolerances and every row check at the boundary, so all of them agree.
+/// The share of a row's contract tolerance the engine uses for the row
+/// itself ([`slack_tol`]). The rest is reserved for what happens to the
+/// point after the engine has verified it: an integer var is rounded and a
+/// fixed var reported at its value, each moving the row by its coefficient
+/// times the snap ([`snap_budget`] keeps that within the reserve), and the
+/// row is re-evaluated in another order of operations (by the user, by the
+/// contract tests, by presolve for the rows it dropped), which costs
+/// round-off the reserve also covers. Presolve grants itself the same share
+/// for the violations its own reductions may introduce.
+pub(crate) const ROW_BUDGET_SHARE: f64 = 0.5;
+
+/// The tolerance a quantity of magnitude `magnitude` is held to under an
+/// absolute tolerance `tol`: `tol` itself, but never finer than the
+/// round-off of computing the quantity. This is the contract: every row and
+/// bound check in the crate is this rule, applied through [`outside`].
 pub(crate) fn row_tolerance(tol: f64, magnitude: f64) -> f64 {
     tol.max(ROUNDOFF_FLOOR * magnitude)
 }
 
+/// The larger finite magnitude of two bounds (zero when both are infinite).
+pub(crate) fn bound_magnitude(lo: f64, hi: f64) -> f64 {
+    [lo.abs(), hi.abs()]
+        .into_iter()
+        .filter(|m| m.is_finite())
+        .fold(0.0, f64::max)
+}
+
+/// The contract on a var's bounds: [`row_tolerance`] at the magnitude of
+/// the bound.
+pub(crate) fn bound_tolerance(feasibility: f64, lo: f64, hi: f64) -> f64 {
+    row_tolerance(feasibility, bound_magnitude(lo, hi))
+}
+
+/// Whether `value` lies outside `[lo, hi]` by more than `tol`: the one
+/// comparison of the contract, written the way the engine tests a basic var
+/// against its bounds, so that every check computes the same bits from the
+/// same numbers (`value - hi > tol` is not the same test in `f64`). A NaN is
+/// outside.
+#[inline]
+pub(crate) fn outside(value: f64, lo: f64, hi: f64, tol: f64) -> bool {
+    value.is_nan() || value < lo - tol || value > hi + tol
+}
+
+/// How far `value` lies outside `[lo, hi]` (zero inside, infinite for a
+/// NaN), for reports.
+pub(crate) fn excursion(value: f64, lo: f64, hi: f64) -> f64 {
+    if value.is_nan() {
+        f64::INFINITY
+    } else {
+        (lo - value).max(value - hi).max(0.0)
+    }
+}
+
+/// Tolerance within which a row's slack counts as at or within its bounds:
+/// the engine's share of the contract in the row's equilibrated units, at
+/// the row's `magnitude` (`|b| + Σ|a_j x_j|`) at the current values. The
+/// row's factor is a power of two, so this is exactly the user's tolerance
+/// on the unscaled row. Refreshed whenever the rows are checked, since the
+/// round-off floor follows the values.
+pub(crate) fn slack_tol(feasibility: f64, row_scale: f64, magnitude: f64) -> f64 {
+    ROW_BUDGET_SHARE * row_tolerance(feasibility * row_scale, magnitude)
+}
+
+/// How far a var with scaled coefficient `coeff` in a row of factor
+/// `row_scale` may sit off a bound before snapping it there (rounding an
+/// integer var, reporting a fixed var at its value) would move the row by
+/// more than the reserve of its contract: the reserve over the coefficient.
+pub(crate) fn snap_budget(feasibility: f64, row_scale: f64, coeff: f64) -> f64 {
+    (1.0 - ROW_BUDGET_SHARE) * feasibility * row_scale / coeff.abs()
+}
+
 /// Tolerance within which a structural var (column factor `scale`, scaled
-/// bounds `min..max`) counts as at or within its bounds, floored at the
-/// round-off of the bound magnitude. For a continuous var it is the user's
-/// feasibility tolerance in user units. For an integer var it is `EPS` in
-/// user units, and no looser than `EPS` in the engine's scaled units:
-/// branch & bound closes a node only on exactly integral values, repairs a
-/// near-integral one by a bound change the dual simplex must act on, and
-/// rounds the value it adopts, which changes every row the var is in by the
-/// coefficient times the rounding; with the matrix scaled to entries of
-/// order one, `EPS` in scaled units keeps that change below the rows'
-/// tolerances whatever the user-unit coefficient is.
-///
-/// `row_budget` bounds EVERY var's tolerance by what the slack that tolerance
-/// permits may change any row the var is in: the row tolerance not used by the
-/// engine (`(1 - ROW_BUDGET_SHARE)` of the contract) divided by the var's
-/// scaled coefficient, minimised over its rows (infinite for a var in no row).
-///
-/// The two kinds of slack it pays for are the same quantity seen from two
-/// sides. An integer var's value is ROUNDED by the MIP layer, moving every row
-/// it is in by the coefficient times the rounding. A continuous var is allowed
-/// to sit `tol` outside its bounds by [`super::Solver::first_violated_bound`],
-/// which moves every row it is in by the coefficient times that slack. Either
-/// way the row must still meet the contract afterwards, so either way the var's
-/// tolerance is capped by what its rows can absorb. Capping only the integer
-/// case let a continuous var legally sit `feasibility` off its bound and push a
-/// row with a coefficient above one past the very tolerance the guard then
-/// checked it against — the engine rejecting its own answer as an
-/// `InternalError`.
+/// bounds `min..max`) counts as at or within its bounds: the user's
+/// tolerance in user units, `feasibility / scale` in the engine's units, but
+/// never more than any of its rows can absorb when the value is snapped to
+/// the bound (`row_budget`, the smallest [`snap_budget`] over the var's
+/// rows; infinite for a var in no row), and never finer than the round-off
+/// of the bound. One rule for every var: the cap is what keeps a big-M row
+/// within contract when its binary is rounded, and a fixed var's report at
+/// its value within the rows presolve substituted it out of.
 pub(crate) fn structural_tol(
     scale: f64,
     min: f64,
     max: f64,
-    contract: f64,
-    integer: bool,
+    feasibility: f64,
     row_budget: f64,
 ) -> f64 {
-    let magnitude = [min.abs(), max.abs()]
-        .into_iter()
-        .filter(|m| m.is_finite())
-        .fold(0.0, f64::max);
-    let base = if integer {
-        contract / scale.max(1.0)
-    } else {
-        contract / scale
-    };
-    base.min(row_budget).max(ROUNDOFF_FLOOR * magnitude)
+    row_tolerance(
+        (feasibility / scale).min(row_budget),
+        bound_magnitude(min, max),
+    )
 }
-
-/// Tolerance within which a row's slack counts as at or within its bounds:
-/// the user's absolute `feasibility` tolerance expressed in the row's
-/// equilibrated units, floored at the round-off of evaluating the row, whose
-/// `magnitude` is `|b| + sum |a_j x_j|` at the current values. This is the
-/// engine's side of [`crate::Tolerances::feasibility`]: a row is held to
-/// what the contract promises ([`row_tolerance`]) minus the round-off of
-/// evaluating it, so that whoever re-evaluates the row from the reported
-/// values in their own order of operations still finds the contract met;
-/// half the round-off allowance always remains, since the engine's own
-/// arithmetic needs room too. Never tighter than `f64` can resolve.
-pub(crate) fn slack_tol(feasibility: f64, row_scale: f64, magnitude: f64) -> f64 {
-    let round_off = ROUNDOFF_FLOOR * magnitude;
-    (row_tolerance(ROW_BUDGET_SHARE * feasibility * row_scale, magnitude) - round_off)
-        .max(round_off / 2.0)
-}
-
-/// The share of a row's contract tolerance the engine may use for the row's
-/// own violation; the rest is reserved for the rounding of the integer vars
-/// in the row (see [`structural_tol`]), so that the point the MIP layer
-/// adopts, with its integer values rounded, still meets the contract.
-pub(crate) const ROW_BUDGET_SHARE: f64 = 0.5;
 
 /// Tolerance within which a reduced cost counts as zero, given the magnitude
 /// `|c_j| + sum |a_ij y_i|` of the terms it was computed from.

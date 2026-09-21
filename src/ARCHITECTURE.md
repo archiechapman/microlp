@@ -190,13 +190,19 @@ scratch, LU refactorized, feasibility flags recomputed honestly. Two contracts m
   load. `slack_basis()` (all slacks basic = identity basis matrix) always loads successfully
   and is the designated recovery everywhere.
 
-**`first_violated_row(values, tol)` / `first_violated_bound(values, tol)` /
-`objective_of(values)`** — evaluate an explicit structural-variable vector (user units)
-against the stored rows (sense recovered from slack bounds) and bounds within the
-**absolute** user tolerance floored at the round-off of the row or bound (`row_tolerance`),
-and compute its objective. Non-finite row activity is infeasible. These are the contract
-check: the rounded-incumbent guard (§5.4) and the pure-LP path (`SolveOutcome::from_lp_stop`)
-apply them, and they are deliberately independent of the current basis values.
+**`reported_values()`** — the verified point in user units, fixed vars at their value: what
+every read-out and every candidate starts from.
+
+**`first_violated_row(values)` / `first_violated_bound(values)` / `objective_of(values)`** —
+evaluate an explicit structural-variable vector (user units) against the stored rows (sense
+recovered from slack bounds) and bounds within the **absolute** user tolerance floored at
+the round-off of the row or bound (`row_tolerance`, through `outside`), and compute its
+objective. Non-finite row activity is infeasible. These are the contract check: the
+rounded-incumbent guard (§5.4) and the pure-LP path (`SolveOutcome::from_lp_stop`) apply
+them. They evaluate a row exactly as the engine's own verification does (`row_activity`,
+term for term in the same order), so a point the engine has verified passes them by
+construction, and they are independent of the current basis values, so a rounded candidate
+is judged on its own merits.
 
 ---
 
@@ -354,8 +360,9 @@ tolerance. The guard makes this impossible to adopt:
 - Guard **fails** → do not adopt; **branch on the offending below-tolerance variable**
   (children `⌊v⌋` / `⌊v⌋+1` fix it exactly, and the dive resolves the truth).
 - If every integer variable is *exactly* integral yet the check failed, that is a
-  contradiction — the engine reported `Finished` only after verifying the same point against
-  the same tolerances — and it is returned as an internal error rather than force-accepted.
+  contradiction — the engine reported `Finished` only after verifying the same point through
+  the same evaluation, with half the contract to spare — and it is returned as an internal
+  error rather than force-accepted.
 
 During zero-objective unboundedness classification, the same funnel runs first; only a valid
 integer point returns `Err(Unbounded)`. If classification is interrupted before an incumbent
@@ -569,9 +576,9 @@ computed quantity is floored at that quantity's round-off:
 
 | Comparison | Tolerance | Constants |
 |---|---|---|
-| Is a basic slack (row) within its bounds? | `slack_tol`: the user contract in the row's scaled units, minus the round-off of evaluating the row (`ROUNDOFF_FLOOR × (|b| + Σ|a_j x_j|)`, refreshed whenever values are recomputed or verified), floored at half that round-off. The engine uses `ROW_BUDGET_SHARE` (½) of the contract; the rest is reserved for integer rounding. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
-| Is a structural var within / at its bounds? | `structural_tol`: for a continuous var the user contract in user units; for an integer var `EPS` in user units and no looser than `EPS` in scaled units. Either way, no looser than what the slack it permits may change any row the var is in (`row_budgets`: `(1 - ROW_BUDGET_SHARE)` of the contract over the var's scaled coefficient, minimised over its rows), and floored at the round-off of the bound magnitude. | `EPS = 1e-10` |
-| Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS` |
+| Is a basic slack (row) within its bounds? | `slack_tol`: the engine's share (`ROW_BUDGET_SHARE`, ½) of the contract `row_tolerance(feasibility × r, m)` in the row's scaled units, at the row's magnitude `m = |b| + Σ|a_j x_j|` at the current values (refreshed whenever the rows are checked). The other half is the reserve: for the snap of an integer or fixed var, and for evaluating the row in another order of operations. | `ROUNDOFF_FLOOR = 1e-14`, `ROW_BUDGET_SHARE = 0.5` |
+| Is a structural var within / at its bounds? | `structural_tol`: the user contract in user units, but never more than any of its rows can absorb when the value is snapped to the bound (`snap_budget`: the row's reserve over the var's scaled coefficient, minimised over its rows), floored at the round-off of the bound magnitude. One rule for every var: it keeps a big-M row within contract when its binary is rounded, and a fixed var's report at its value within the rows presolve substituted it out of. | |
+| Is a reduced cost zero? | `dual_tol`: `EPS` floored at the round-off of `|c_j| + Σ|a_ij y_i|`, refreshed with the multipliers. | `EPS = 1e-10` |
 | Is a tableau entry a candidate pivot? | genuine if above the round-off of computing it (`ENTRY_ROUNDOFF` relative to the larger of its own terms and the row's largest entry), and at least `PIVOT_REL_TOL` of the largest genuine entry among the vars that could enter (rows that could block, in the primal test). | `ENTRY_ROUNDOFF = 1e-15`, `PIVOT_REL_TOL = 1e-7` |
 | Do the row and column computations of the pivot element agree? | to `PIVOT_AGREEMENT_TOL` relatively or to `ENTRY_ROUNDOFF` of the computations' scale; else rebuild (stale factorization) or exclude the entry as noise (fresh one). | `PIVOT_AGREEMENT_TOL = 1e-7` |
 | Is the LU pivot column singular? | eligible part below `LU_SINGULAR_REL` of the column's largest transformed entry. | `= ROUNDOFF_FLOOR` |
@@ -581,23 +588,27 @@ regularly, a non-basic continuous var or slack may enter by crossing its bound (
 fixed value) by no more than its own tolerance — "at a bound" means within tolerance
 everywhere, so it is still at its bound afterwards; this is how a round-off-level violation
 that a tightly held var cannot carry is handed to a row or var that can. Integer vars never
-absorb. **Verified termination:** a phase reports `Finished` only after `verify_primal`
-(residuals of every row at the current values; when a row exceeds its tolerance, iterative
-refinement through the factorization, then a fresh factorization and further refinement,
-then a loud `InternalError` if the basis cannot represent its vertex; the refined vertex is
-kept unless it leaves a bound the verified point satisfied) and exact reduced costs
-(recomputed only when pivots have updated them incrementally since); a dual infeasibility
-whose only primal step is degenerate and would land the entering var outside its tolerance
-is not an improving direction (`PivotChoice::Unexploitable`). The objective is always
-recomputed from the values. Values within tolerance are not refined at a phase exit — the
-contract asks no more, and moving last bits steers the branch & bound — but what is
-reported to the user (the pure-LP solution, a MIP candidate) is polished once by
-`polished_values`: one refinement step, kept only if it stays within every bound. Periodic
+absorb. **Verified termination:** a phase reports `Finished` only after `verify_primal` and exact
+reduced costs (recomputed only when pivots have updated them incrementally since); a dual
+infeasibility whose only primal step is degenerate and would land the entering var outside
+its tolerance is not an improving direction (`PivotChoice::Unexploitable`). `verify_primal`
+runs `check_rows`: every basic slack is re-derived from its row, `s = b − Σ a_j x_j` at the
+current structural values, so that a row's violation lives in its slack's value where the
+dual simplex sees it; the slack tolerances are refreshed from the rows' magnitudes; and the
+residual of every row whose slack is non-basic (how far the basic structural values are from
+solving it) must lie within the row's tolerance, else the values are refined through the
+factorization, then through a fresh one, then reported as a loud `InternalError` (the basis
+cannot represent its vertex). Values within tolerance are not refined: the contract asks no
+more, and moving last bits steers the branch & bound. The objective is always recomputed from
+the values. What is reported (`reported_values`) is the verified point itself, with fixed
+vars at their value; the checks at the boundary (`first_violated_row`, the MIP guard) repeat
+`check_rows`' evaluation of a row term for term on that point (`row_activity`), against the
+full contract, so a verified point passes them with the reserve to spare. Periodic
 refactorization (`refactorize`) renews the factorization and, once per full basis turnover
-of pivots, checks the residuals and recomputes the values if they drifted; the eta file
-stores `1/pivot`. A recompute is not a verification: on an ill-conditioned basis a solve
-through the factorization can leave a residual above a row's tolerance, so recomputed values
-stay unverified until the next phase exit checks and, if needed, refines them.
+of pivots, checks the rows and recomputes the values if they drifted; the eta file stores
+`1/pivot`. A recompute is not a verification: on an ill-conditioned basis a solve through
+the factorization can leave a residual above a row's tolerance, so recomputed values stay
+unverified until the next phase exit checks and, if needed, refines them.
 
 **Presolve** (`src/presolve/`, module docs) makes its decisions with the same model, in
 user units: a row is held to the engine's *budget*, `ROW_BUDGET_SHARE` of
@@ -623,17 +634,18 @@ The layering rule: the engine's tolerances decide *simplex* questions; `int_tol`
 *integrality* questions; `feasibility` is the contract presolve, the engine and *solution
 acceptance* all hold to; `prune_epsilon` decides *tree* questions.
 
-A var's tolerance is capped by its rows, and this is what keeps bound slack and row slack
-from being double-counted. The slack a var's tolerance permits does not stay with the var:
-it arrives at every row the var is in, multiplied by the coefficient. An integer var's
-rounding and a continuous var's legal excursion outside its bounds are the same quantity
-seen from two sides, so both are capped by `(1 - ROW_BUDGET_SHARE)` of the row's contract
-over the var's scaled coefficient, minimised over its rows. Capping only the integer case
-was a real bug: a continuous var could legally sit `feasibility` off its bound and, through
-a coefficient above one, push its row past the very tolerance solution acceptance then
-checked it against — so the engine rejected its own answer as an `InternalError`. Both
-`origin_feasible` and the magnitude properties found it; the counterexample is pinned as
-`property_counterexample_with_bound_slack_one_ulp_over_the_row_budget`.
+What makes this one contract rather than several checks: the engine, the MIP guard, the
+pure-LP validation and presolve share `row_tolerance` (the rule), `bound_tolerance` (its
+instance for a var's bounds) and `outside` (the one comparison, written the way the engine
+tests a basic var, `value < lo − tol || value > hi + tol`, which in `f64` is not the same
+test as `value − hi > tol`). The engine holds a row to half the contract and caps every var's
+bound tolerance by its rows' reserve, so the point it verifies passes the same evaluation at
+the boundary with the other half to spare. Each counterexample the property tests found
+before this model was a disagreement between two of those checks — a continuous var's bound
+slack reaching a row through a coefficient above one, a fixed var's drift reaching a row
+presolve had dropped, a residual counted once by the engine and once more by the guard — and
+each is pinned as a regression test (for example
+`property_counterexample_with_bound_slack_one_ulp_over_the_row_budget`).
 
 Known limitation: a feasible region reachable only through a pivot within the round-off
 of its row (coefficient chains spanning some twelve to fifteen orders of magnitude within

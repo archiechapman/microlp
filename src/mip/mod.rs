@@ -159,20 +159,14 @@ pub(crate) fn candidate_variables_feasible(
     }
     values.iter().enumerate().all(|(v, &value)| {
         let (lo, hi) = bounds(v);
-        // The same rule as the engine's structural tolerances and the LP
-        // path's validation: the user tolerance, floored at the round-off of
-        // the bound's magnitude.
-        let magnitude = [lo.abs(), hi.abs()]
-            .into_iter()
-            .filter(|m| m.is_finite())
-            .fold(0.0, f64::max);
-        let tol = crate::solver::row_tolerance(tolerances.feasibility, magnitude);
+        // The contract on a bound, the same rule and the same comparison as
+        // the engine's and the LP path's.
+        let tol = crate::solver::bound_tolerance(tolerances.feasibility, lo, hi);
         value.is_finite()
             && !lo.is_nan()
             && !hi.is_nan()
             && lo <= hi
-            && value >= lo - tol
-            && value <= hi + tol
+            && !crate::solver::outside(value, lo, hi, tol)
             && (!matches!(domains[v], VarDomain::Integer | VarDomain::Boolean)
                 || (value - value.round()).abs() <= tolerances.integrality_rounding)
     })
@@ -220,14 +214,16 @@ pub(crate) fn first_violation(
         if !lhs.is_finite() {
             return Some(format!("row {row} has a non-finite activity"));
         }
-        // The same rule as the engine's rows and `Solver::first_violated_row`.
+        // The contract on a row, as `Solver::first_violated_row` applies it:
+        // the slack the row implies, against the slack bounds its sense
+        // encodes.
         let tol = crate::solver::row_tolerance(tolerances.feasibility, magnitude);
-        let ok = match op {
-            ComparisonOp::Eq => (lhs - rhs).abs() <= tol,
-            ComparisonOp::Le => lhs <= rhs + tol,
-            ComparisonOp::Ge => lhs >= *rhs - tol,
+        let (smin, smax) = match op {
+            ComparisonOp::Eq => (0.0, 0.0),
+            ComparisonOp::Le => (0.0, f64::INFINITY),
+            ComparisonOp::Ge => (f64::NEG_INFINITY, 0.0),
         };
-        if !ok {
+        if crate::solver::outside(rhs - lhs, smin, smax, tol) {
             return Some(format!(
                 "row {row} ({op:?} {rhs:e}) has activity {lhs:e}, tolerance {tol:e}, at {values:?}"
             ));

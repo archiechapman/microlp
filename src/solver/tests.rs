@@ -445,7 +445,7 @@ fn check_constraints_rejects_non_finite_activity() {
     )
     .unwrap();
 
-    assert!(solver.first_violated_row(&[1.0e308], 1.0e-7).is_some());
+    assert!(solver.first_violated_row(&[1.0e308]).is_some());
 }
 
 #[test]

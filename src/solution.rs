@@ -27,8 +27,8 @@ pub struct Solution {
     pub(crate) state: SolveState,
     pub(crate) last_options: ResumeOptions,
     /// For an LP solution, the structural values in user units, captured
-    /// (and polished, see `Solver::polished_values`) when the solution was
-    /// created; the engine stores them in scaled units and converts on
+    /// (the verified point, see `Solver::reported_values`) when the solution
+    /// was created; the engine stores them in scaled units and converts on
     /// access, so `Index` needs a place to borrow from. Empty for a MIP
     /// solution, which borrows from its incumbent.
     pub(crate) lp_values: Vec<f64>,

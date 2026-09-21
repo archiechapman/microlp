@@ -269,40 +269,46 @@ fn try_adopt_incumbent_respects_custom_feasibility_tolerance() {
     // but not exactly 0; the rounded-incumbent guard then re-checks the
     // ROUNDED point (b -> 0) against the ORIGINAL row, which is off by
     // exactly m * 5e-7 = 500 — precisely the "big-M trap"
-    // `tolerances.feasibility` exists to catch, in absolute terms.
+    // `tolerances.feasibility` exists to catch, in absolute terms. The guard
+    // applies the tolerance the search was built with (the engine and the
+    // guard share one contract), so each tolerance gets its own search.
     let m = 1.0e9;
     let mut p = Problem::new(OptimizationDirection::Minimize);
     let x = p.add_var(1.0, (0.0, f64::INFINITY));
     let b = p.add_binary_var(0.0);
     p.add_constraint(&[(x, 1.0), (b, -m)], ComparisonOp::Eq, 10.0);
 
-    let mut solved = run(&p, SolveOptions::default()).unwrap();
-    let state = &mut solved.state;
-
-    // Force the relaxation to a specific near-zero fractional b: pin its
-    // bounds to [5e-7, 5e-7] and re-solve. The equality row then forces x
-    // to exactly 10 + m*5e-7 = 510, deterministically — no dependence on
-    // which vertex the simplex would otherwise have picked.
-    state.solver.set_var_bounds(b.idx(), 5e-7, 5e-7).unwrap();
-    assert_eq!(
-        state.solver.reoptimize().unwrap(),
-        crate::StopReason::Finished
-    );
-    assert!((state.solver.get_value(x.idx()) - 510.0).abs() < 1e-6);
+    let pin_and_adopt = |feasibility: f64| -> (f64, bool) {
+        let mut options = SolveOptions::default();
+        options.tolerances.feasibility = feasibility;
+        let mut solved = run(&p, options).unwrap();
+        let state = &mut solved.state;
+        // Force the relaxation to a specific near-zero fractional b: pin its
+        // bounds to [5e-7, 5e-7] and re-solve. The equality row then forces
+        // x to 10 + m*5e-7 = 510, deterministically.
+        state.solver.set_var_bounds(b.idx(), 5e-7, 5e-7).unwrap();
+        assert_eq!(
+            state.solver.reoptimize().unwrap(),
+            crate::StopReason::Finished
+        );
+        let x_value = state.solver.get_value(x.idx());
+        (x_value, try_adopt_incumbent(state).unwrap())
+    };
 
     // Default tolerance (1e-7): the rounded point (x=510, b=0) misses the
     // original `x - m*b == 10` row by 500 — must be rejected.
-    state.options.tolerances.feasibility = Tolerances::default().feasibility;
+    let (x_value, adopted) = pin_and_adopt(Tolerances::default().feasibility);
+    assert!((x_value - 510.0).abs() < 1e-6);
     assert!(
-        !try_adopt_incumbent(state).unwrap(),
+        !adopted,
         "a 500-unit rounding-induced violation must be rejected at the default feasibility tolerance"
     );
 
     // Absurdly loosened tolerance: the same 500-unit violation is now
     // within bounds — the guard must accept it.
-    state.options.tolerances.feasibility = 1e6;
+    let (_, adopted) = pin_and_adopt(1e6);
     assert!(
-        try_adopt_incumbent(state).unwrap(),
+        adopted,
         "the same violation must be accepted once tolerances.feasibility is loosened past it"
     );
 }

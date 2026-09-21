@@ -17,7 +17,7 @@ use crate::{Error, StopReason, VarDomain};
 /// caller must branch. A valid candidate completes unboundedness classification.
 pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
     let tolerances = &state.options.tolerances;
-    let mut values = state.solver.polished_values();
+    let mut values = state.solver.reported_values();
     let solver = &state.solver;
     let domains = &solver.orig_var_domains;
     for (val, dom) in values.iter_mut().zip(domains.iter()) {
@@ -31,7 +31,7 @@ pub(crate) fn try_adopt_incumbent(state: &mut MipState) -> Result<bool, Error> {
         );
         return Ok(false);
     }
-    if let Some((row, violation)) = solver.first_violated_row(&values, tolerances.feasibility) {
+    if let Some((row, violation)) = solver.first_violated_row(&values) {
         debug!(
             "integral-within-tol solution rejected: rounded values violate row {row} by {violation:e}"
         );
@@ -64,11 +64,12 @@ enum IntegralCandidate {
 
 /// Adopt a feasible rounded candidate, but close the current subtree only when
 /// the LP point itself is exactly integral. An exactly integral point that
-/// fails the independent feasibility guard is a contradiction: the engine
-/// reports `Finished` only after recomputing its values from the
-/// factorization and verifying them against the rows within the same
-/// tolerances the guard applies, so this cannot be round-off. It is reported
-/// loudly rather than papered over.
+/// fails the feasibility guard is a contradiction: the engine reports
+/// `Finished` only after verifying the very values it reports through the
+/// very evaluation the guard repeats (`Solver::check_rows` and
+/// `Solver::first_violated_row` share it), with half the contract to spare,
+/// so this cannot be round-off. It is reported loudly rather than papered
+/// over.
 fn process_integral_candidate(
     state: &mut MipState,
     domains: &[VarDomain],

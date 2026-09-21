@@ -10,7 +10,7 @@ use super::model::{
     bound_magnitude, is_int_domain, term_range, Activity, Mode, PresolveStats, Row,
 };
 use super::params::*;
-use crate::solver::{row_tolerance, ROUNDOFF_FLOOR, ROW_BUDGET_SHARE};
+use crate::solver::{bound_tolerance, row_tolerance, ROUNDOFF_FLOOR, ROW_BUDGET_SHARE};
 use crate::{Error, VarDomain};
 
 /// Bound state and reduction context. Rows live OUTSIDE this struct so the
@@ -65,7 +65,7 @@ impl Work<'_> {
         if self.is_int(v) {
             0.0
         } else {
-            row_tolerance(self.feas, bound_magnitude(self.elo[v], self.ehi[v]))
+            bound_tolerance(self.feas, self.elo[v], self.ehi[v])
         }
     }
 
@@ -420,7 +420,7 @@ impl Work<'_> {
         // A genuine bound: the engine may leave it by the bound tolerance,
         // which must keep the row within budget on every side the row
         // provides.
-        let btol = row_tolerance(self.feas, bound_magnitude(new_lo, new_hi));
+        let btol = bound_tolerance(self.feas, new_lo, new_hi);
         if (new_lo > self.elo[v] && a.abs() * btol > side_budget(self, blo))
             || (new_hi < self.ehi[v] && a.abs() * btol > side_budget(self, bhi))
         {
