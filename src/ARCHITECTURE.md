@@ -337,9 +337,14 @@ runs on incrementally updated numbers, so a phase may end on drifted values, and
 verified state is reported as `Finished`. One valve lives in `restore_feasibility`: "no
 eligible entering column for a violated row" proves infeasibility only in exact arithmetic,
 so before an infeasibility declaration can stand the engine rebuilds (fresh factorization,
-values, reduced costs) and re-examines the row; a phantom violation dissolves, a real one
-survives. The valve is armed once per stall and any successful pivot re-arms it, so it
-cannot loop.
+values, reduced costs) and re-examines that same row at once: still violated with no
+entering column, the LP is infeasible; a phantom violation dissolves, and the phase carries on
+with normal pricing. The valve is armed once per stall and any successful pivot re-arms it.
+The immediate re-examination is what keeps that from looping: pricing afresh after the
+rebuild could choose a different row, pivot on it and re-arm the valve, and on an infeasible
+LP whose rebuilds keep bringing pricing back that way the declaration would never stand.
+After a rebuild that repaired the basis (§3) the row holds a different variable, so it is not
+re-examined.
 
 ### 5.4 Incumbents and the rounded-feasibility guard
 
@@ -689,7 +694,7 @@ basic values that counted as a verification. Both are ordinary regression tests 
 | Exactly-integral candidate failing the guard | `InternalError` (the engine verified the same point; see §5.4) |
 | Verified state unreachable (`MAX_PHASE_ROUNDS` alternations, or a basis that cannot represent its vertex) | `InternalError`, never an unverified optimum |
 | `load_basis` failure on a jump | load the slack basis (infallible) and solve the node from scratch |
-| Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs) and retry once per stall; declare `Infeasible` only if it survives the rebuild |
+| Phase-1 stall (“no entering column”) | rebuild (fresh LU + recomputed values and reduced costs) and re-examine the same row; declare `Infeasible` if it survives the rebuild |
 | Deadline mid-LP | requeue the node unsolved; return `Interrupted` |
 | Limit with no incumbent | `SolveOutcome::Interrupted`; only reason, stats, and resume are exposed |
 | Search exhausted, no incumbent | `Err(Infeasible)` |

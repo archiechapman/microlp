@@ -530,3 +530,45 @@ fn load_basis_rejects_wrong_shape() {
     solver.load_basis(&slack).unwrap();
     assert_eq!(solver.reoptimize().unwrap(), StopReason::Finished);
 }
+
+#[test]
+fn refresh_valve_reexamines_the_deferred_row() {
+    // min x + y, x, y >= 0, with
+    //   row 0 (A): x + y <= -1   infeasible: its slack can only rise if x or y falls
+    //   row 1 (B): x >= 5        violated by 5, and x can enter to repair it
+    // B's stored basic value is corrupted to look feasible, as round-off can leave
+    // it. Pricing then sees only A, finds no entering column, and the valve
+    // rebuilds, which restores B's violation. The declaration it deferred is A's,
+    // so A must be re-examined next: it is still violated with no entering
+    // column, and the LP is infeasible. Pricing afresh would pick B instead (the
+    // larger violation) and pivot x in, re-arming the valve; when the rebuild
+    // keeps bringing pricing back like this, as on a large MILP node LP after
+    // ~2M pivots, the phase never ends.
+    init();
+    let mut solver = Solver::try_new(
+        &[1.0, 1.0],
+        &[0.0, 0.0],
+        &[f64::INFINITY, f64::INFINITY],
+        &[
+            (to_sparse(&[1.0, 1.0]), ComparisonOp::Le, -1.0),
+            (to_sparse(&[1.0, 0.0]), ComparisonOp::Ge, 5.0),
+        ],
+        &[VarDomain::Real, VarDomain::Real],
+        Default::default(),
+        crate::Tolerances::default().feasibility,
+    )
+    .unwrap();
+    assert!(solver.is_dual_feasible && !solver.is_primal_feasible);
+    let row_b = match solver.var_states[solver.num_vars + 1] {
+        VarState::Basic(r) => r,
+        VarState::NonBasic(_) => panic!("slack basis expected"),
+    };
+    let (min, max) = (solver.basic_var_mins[row_b], solver.basic_var_maxs[row_b]);
+    solver.basic_var_vals[row_b] = 0.0f64.clamp(min, max);
+
+    assert_eq!(solver.restore_feasibility(), Err(Error::Infeasible));
+    assert!(
+        matches!(solver.var_states[0], VarState::NonBasic(_)),
+        "x was pivoted in after the rebuild: the deferred row was not re-examined"
+    );
+}

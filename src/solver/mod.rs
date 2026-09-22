@@ -1433,8 +1433,29 @@ impl Solver {
                              rebuilding before declaring infeasibility",
                                 iter, row,
                             );
+                            self.basis_repaired = false;
                             self.rebuild()?;
+                            let repaired = std::mem::take(&mut self.basis_repaired);
                             refreshed_since_pivot = true;
+                            // Re-examine THIS row on the rebuilt values: if it is
+                            // still violated and still has no entering column, the
+                            // declaration the rebuild deferred stands now. Pricing
+                            // afresh can pick another row instead, and a pivot there
+                            // re-arms the valve; when the rebuild keeps bringing
+                            // pricing back like that, the declaration never stands
+                            // and the phase cycles on an infeasible LP. A repair
+                            // changes which var each row holds, so after one this
+                            // row is no longer the deferred one: price normally.
+                            if !repaired {
+                                if let Some(new_val) = self.violated_bound(row) {
+                                    self.calc_row_coeffs(row);
+                                    if let Err(Error::Infeasible) =
+                                        self.choose_entering_col_dual(row, new_val, &excluded_cols)
+                                    {
+                                        return Err(Error::Infeasible);
+                                    }
+                                }
+                            }
                             continue;
                         }
                         Err(e) => return Err(e),
@@ -1900,6 +1921,21 @@ impl Solver {
                 entering_diff: entering_other_val - entering_cur_val,
                 elem: None,
             }))
+        }
+    }
+
+    /// The bound basic row `r` would leave at if it is still violated (by the same
+    /// tolerance test as [`Self::choose_pivot_row_dual`]), else `None`.
+    fn violated_bound(&self, r: usize) -> Option<f64> {
+        let val = self.basic_var_vals[r];
+        let (min, max) = (self.basic_var_mins[r], self.basic_var_maxs[r]);
+        let tol = self.var_tols[self.basic_vars[r]];
+        if val < min - tol {
+            Some(min)
+        } else if val > max + tol {
+            Some(max)
+        } else {
+            None
         }
     }
 
