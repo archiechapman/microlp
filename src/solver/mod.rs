@@ -23,7 +23,7 @@ use core::time::Duration;
 
 use crate::{
     helpers::{resized_view, to_dense},
-    lu::{lu_factorize, ScratchSpace},
+    lu::{lu_factorize, Replacement, ScratchSpace},
     sparse::{ScatteredVec, SparseVec},
     ComparisonOp, CsVec, Error, StopReason, VarDomain,
 };
@@ -155,6 +155,10 @@ pub(crate) struct Solver {
     sq_norms_update_helper: Vec<f64>,
     inv_basis_row_coeffs: SparseVec,
     row_coeffs: ScatteredVec,
+
+    /// Raised by [`Self::refactor_repairing`] when a singular refactorization changed the
+    /// basis; the primal simplex consumes it to decide whether it can continue.
+    basis_repaired: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -507,6 +511,7 @@ impl Solver {
             sq_norms_update_helper,
             inv_basis_row_coeffs: SparseVec::new(),
             row_coeffs: ScatteredVec::empty(num_total_vars - num_constraints),
+            basis_repaired: false,
         };
 
         debug!(
@@ -816,10 +821,89 @@ impl Solver {
     /// current numbers themselves are in doubt (a pivot disagreement, a stall
     /// before declaring infeasibility), so nothing is gated.
     fn rebuild(&mut self) -> Result<(), Error> {
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        if self.refactor_repairing()? {
+            // A repair recomputed everything already.
+            return Ok(());
+        }
         self.recalc_basic_var_vals()?;
         self.recalc_obj_coeffs()
+    }
+
+    /// Refactorize the current basis. If it has become numerically singular, repair it
+    /// instead of failing: each dependent basic column is swapped for the slack of a row
+    /// the factorization could not cover (a unit column), and the evicted variable becomes
+    /// non-basic at its nearest finite bound (free variables keep their value).
+    ///
+    /// Returns whether the basis changed. When it did, basic values and reduced costs are
+    /// recomputed, steepest-edge weights are reset, and both feasibility flags are set
+    /// honestly; `basis_repaired` is raised so a running primal simplex can react.
+    fn refactor_repairing(&mut self) -> Result<bool, Error> {
+        let num_vars = self.num_vars;
+        let var_states = &self.var_states;
+        let replaced = self.basis_solver.reset_repairing(
+            &self.orig_constraints_csc,
+            &self.basic_vars,
+            &|row| !matches!(var_states[num_vars + row], VarState::Basic(_)),
+        )?;
+        if replaced.is_empty() {
+            return Ok(false);
+        }
+
+        for &Replacement { col: pos, row } in &replaced {
+            let slack = num_vars + row;
+            let VarState::NonBasic(nb_idx) = self.var_states[slack] else {
+                unreachable!("repair row {row} has a basic slack");
+            };
+            let evicted = self.basic_vars[pos];
+            let (min, max) = (self.orig_var_mins[evicted], self.orig_var_maxs[evicted]);
+            let cur = self.basic_var_vals[pos];
+            let val = match (min.is_finite(), max.is_finite()) {
+                (true, true) => {
+                    if (cur - min).abs() <= (max - cur).abs() {
+                        min
+                    } else {
+                        max
+                    }
+                }
+                (true, false) => min,
+                (false, true) => max,
+                (false, false) => cur,
+            };
+
+            self.basic_vars[pos] = slack;
+            self.var_states[slack] = VarState::Basic(pos);
+            self.basic_var_mins[pos] = self.orig_var_mins[slack];
+            self.basic_var_maxs[pos] = self.orig_var_maxs[slack];
+
+            let tol = self.var_tols[evicted];
+            self.nb_vars[nb_idx] = evicted;
+            self.var_states[evicted] = VarState::NonBasic(nb_idx);
+            self.nb_var_vals[nb_idx] = val;
+            self.nb_var_states[nb_idx] = NonBasicVarState {
+                at_min: at_bound(val, min, tol),
+                at_max: at_bound(val, max, tol),
+            };
+            if self.enable_primal_steepest_edge {
+                self.primal_edge_sq_norms[nb_idx] = 1.0;
+            }
+        }
+        debug!(
+            "basis repair: {} dependent column(s) swapped for slacks",
+            replaced.len()
+        );
+
+        // The factors were built with unit columns in the repaired positions, which are
+        // exactly the slack columns now basic there.
+        if self.enable_dual_steepest_edge {
+            self.dual_edge_sq_norms = vec![1.0; self.basic_vars.len()];
+        }
+        self.recalc_basic_var_vals()?;
+        self.recalc_obj_coeffs()?;
+        self.values_dirty = true;
+        self.is_primal_feasible = self.calc_primal_infeasibility().0 == 0;
+        self.is_dual_feasible = self.calc_dual_infeasibility().0 == 0;
+        self.basis_repaired = true;
+        Ok(true)
     }
 
     /// The periodic refactorization: a fresh factorization, and the basic
@@ -832,8 +916,10 @@ impl Solver {
     /// The reduced costs are left to their incremental updates; the phase
     /// exit recomputes them exactly before anything is reported.
     fn refactorize(&mut self) -> Result<(), Error> {
-        self.basis_solver
-            .reset(&self.orig_constraints_csc, &self.basic_vars)?;
+        if self.refactor_repairing()? {
+            // A repaired basis recomputed its values; there is no drift to check.
+            return Ok(());
+        }
         // The residual check costs a pass over the matrix; on a small basis
         // the factorization is renewed almost every pivot, so the check is
         // made once per full turnover of the basis (one pivot per row). The
@@ -914,9 +1000,9 @@ impl Solver {
         }
         if !hold {
             debug!("verify: residual persists through the factorization; refactorizing");
-            self.basis_solver
-                .reset(&self.orig_constraints_csc, &self.basic_vars)?;
-            self.recalc_basic_var_vals()?;
+            if !self.refactor_repairing()? {
+                self.recalc_basic_var_vals()?;
+            }
             hold = self.check_rows(&mut residuals) || self.refine(&mut residuals);
             if !hold {
                 return Err(Error::InternalError(
@@ -1207,7 +1293,16 @@ impl Solver {
         let mut excluded_rows: Vec<usize> = Vec::new();
         let mut excluded_cols: Vec<usize> = Vec::new();
         let mut pivoted = false;
+        self.basis_repaired = false;
         for iter in 0.. {
+            if std::mem::take(&mut self.basis_repaired) && !self.is_primal_feasible {
+                // A basis repair (in a pivot's refactorization or a rebuild) cost
+                // primal feasibility, which this phase needs: hand back to
+                // `run_phases`, which restores it. The dual flag was set honestly
+                // by the repair.
+                debug!("optimize iter {iter}: basis repaired to a primal infeasible basis");
+                return Ok((StopReason::Finished, pivoted));
+            }
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {

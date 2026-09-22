@@ -6,7 +6,7 @@
 //! [`super::Solver`] produce and then apply.
 
 use crate::{
-    lu::{lu_factorize, LUFactors, ScratchSpace},
+    lu::{lu_factorize, lu_factorize_repairing, LUFactors, Replacement, ScratchSpace},
     sparse::{ScatteredVec, SparseMat, SparseVec},
     CsVec, Error,
 };
@@ -132,6 +132,35 @@ impl BasisSolver {
             debug_assert!(diag != 0.0, "eta column without its pivot entry");
             y[r_leaving] = diag * y[r_leaving] - acc;
         }
+    }
+
+    /// [`Self::reset`] with basis repair: see [`lu_factorize_repairing`]. `row_available`
+    /// must hold exactly for rows whose slack is non-basic.
+    pub(crate) fn reset_repairing(
+        &mut self,
+        orig_constraints_csc: &CsMat,
+        basic_vars: &[usize],
+        row_available: &dyn Fn(usize) -> bool,
+    ) -> Result<Vec<Replacement>, Error> {
+        self.scratch.clear_sparse(basic_vars.len());
+        self.eta_matrices.clear_and_resize(basic_vars.len());
+        self.rhs.clear_and_resize(basic_vars.len());
+        let (lu_factors, replaced) = lu_factorize_repairing(
+            basic_vars.len(),
+            |c| {
+                orig_constraints_csc
+                    .outer_view(basic_vars[c])
+                    //guaranteed to be a valid index
+                    .unwrap()
+                    .into_raw_storage()
+            },
+            LU_STABILITY_THRESHOLD,
+            &mut self.scratch,
+            row_available,
+        )?;
+        self.lu_factors = lu_factors;
+        self.lu_factors_transp = self.lu_factors.transpose();
+        Ok(replaced)
     }
 
     pub(crate) fn reset(

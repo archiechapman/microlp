@@ -135,6 +135,60 @@ pub fn lu_factorize<'a>(
     stability_coeff: f64,
     scratch: &mut ScratchSpace,
 ) -> Result<LUFactors, Error> {
+    lu_factorize_impl(size, get_col, stability_coeff, scratch, None)
+}
+
+/// A column of the input matrix that [`lu_factorize_repairing`] replaced by a unit
+/// column because it was numerically dependent on the columns factored before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Replacement {
+    /// Index of the dependent input column.
+    pub col: usize,
+    /// Row `r` of the unit column `e_r` that took its place.
+    pub row: usize,
+}
+
+/// Like [`lu_factorize`], but a numerically dependent column does not fail the
+/// factorization: it is replaced by the unit column `e_r` of a row `r` that has
+/// no pivot yet and for which `row_available(r)` holds, and the replacement is
+/// reported. The factors are those of the repaired matrix. This is the standard
+/// simplex basis repair: `e_r` is the column of row `r`'s slack variable, so the
+/// caller swaps that slack into the basis in place of the dependent column.
+///
+/// `row_available` must reject rows whose unit column is already part of the
+/// matrix (a basic slack); among the unpivoted rows there is always one it
+/// accepts, because a unit column pivots on its own row.
+pub fn lu_factorize_repairing<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    row_available: &dyn Fn(usize) -> bool,
+) -> Result<(LUFactors, Vec<Replacement>), Error> {
+    let mut replaced = Vec::new();
+    let lu = lu_factorize_impl(
+        size,
+        get_col,
+        stability_coeff,
+        scratch,
+        Some((row_available, &mut replaced)),
+    )?;
+    Ok((lu, replaced))
+}
+
+/// The repair hook of [`lu_factorize_impl`]: the `row_available` predicate of
+/// [`lu_factorize_repairing`], paired with the log the substitutions it makes
+/// are reported through. `None` factorizes strictly, failing on a dependent
+/// column.
+type RepairHook<'a> = (&'a dyn Fn(usize) -> bool, &'a mut Vec<Replacement>);
+
+fn lu_factorize_impl<'a>(
+    size: usize,
+    get_col: impl Fn(usize) -> (&'a [usize], &'a [f64]),
+    stability_coeff: f64,
+    scratch: &mut ScratchSpace,
+    mut repair: Option<RepairHook<'_>>,
+) -> Result<LUFactors, Error> {
     // Implementation of the Gilbert-Peierls algorithm:
     //
     // Gilbert, John R., and Tim Peierls. "Sparse partial pivoting in time
@@ -211,7 +265,7 @@ pub fn lu_factorize<'a>(
             // against: a column whose remaining part is negligible relative
             // to what was already eliminated is linearly dependent on the
             // previous columns up to round-off, whatever its absolute scale.
-            let mut max_abs = 0.0;
+            let mut max_abs: f64 = 0.0;
             let mut col_max = 0.0;
             for &orig_r in &scratch.rhs.nonzero {
                 let abs = f64::abs(scratch.rhs.values[orig_r]);
@@ -227,7 +281,23 @@ pub fn lu_factorize<'a>(
             }
 
             if !max_abs.is_normal() || max_abs < LU_SINGULAR_REL * col_max {
-                return Err(Error::SingularMatrix);
+                let Some((row_available, replaced)) = repair.as_mut() else {
+                    return Err(Error::SingularMatrix);
+                };
+                let pos = col_perm.new2orig[i_col];
+                // Substitute the unit column of an unpivoted, available row. Its
+                // forward solve is the unit vector itself (no pivoted row touches
+                // it), so it pivots on that row with value 1.
+                let Some(row) = (0..size)
+                    .filter(|&r| orig2new_row[r] >= i_col && row_available(r))
+                    .min_by_key(|&r| orig_row2elt_count[r])
+                else {
+                    return Err(Error::SingularMatrix);
+                };
+                replaced.push(Replacement { col: pos, row });
+                scratch.rhs.clear();
+                *scratch.rhs.get_mut(row) = 1.0;
+                max_abs = 1.0;
             }
 
             // Choose among eligible pivot rows one with the least elements.

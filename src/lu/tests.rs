@@ -148,6 +148,70 @@ fn lu_singular() {
     }
 }
 
+/// The same two singular matrices as `lu_singular`, but factored with a
+/// repair hook: a dependent column is replaced by the unit column of a row
+/// that has no pivot yet, the substitution is reported, and the factors
+/// returned are those of the repaired matrix (so they invert it).
+#[test]
+fn lu_repairing() {
+    init();
+    let size = 3;
+
+    let symbolically_singular: &[(usize, usize, f64)] =
+        &[(0, 0, 1.0), (1, 0, 1.0), (1, 1, 2.0), (1, 2, 3.0)];
+    let numerically_singular: &[(usize, usize, f64)] = &[
+        (0, 0, 1.0),
+        (1, 0, 1.0),
+        (1, 1, 2.0),
+        (1, 2, 3.0),
+        (2, 0, 2.0),
+        (2, 1, 2.0),
+        (2, 2, 3.0),
+    ];
+
+    for triplets in [symbolically_singular, numerically_singular] {
+        let mat = mat_from_triplets(size, size, triplets);
+
+        let mut scratch = ScratchSpace::with_capacity(size);
+        let (lu, replaced) = lu_factorize_repairing(
+            size,
+            |c| mat.outer_view(c).unwrap().into_raw_storage(),
+            0.9,
+            &mut scratch,
+            &|_| true,
+        )
+        .expect("a repairing factorization must not fail on a singular matrix");
+
+        // Both matrices have rank 2: exactly one column is dependent.
+        assert_eq!(replaced.len(), 1);
+        let Replacement { col, row } = replaced[0];
+
+        // Rebuild the matrix the repair actually factored: `col` swapped
+        // for the unit column of `row`.
+        let repaired = {
+            let mut kept = triplets
+                .iter()
+                .copied()
+                .filter(|(_, c, _)| *c != col)
+                .collect::<Vec<_>>();
+            kept.push((row, col, 1.0));
+            mat_from_triplets(size, size, &kept)
+        };
+
+        // Solving with the factors and multiplying back by the repaired
+        // matrix must return the right-hand side.
+        let sparse_rhs = to_sparse(&[1.0, -2.0, 3.0]);
+        let mut rhs = ScatteredVec::empty(size);
+        rhs.set(sparse_rhs.iter());
+        lu.solve(&mut rhs, &mut scratch);
+        let diff = &sparse_rhs - &(&repaired * &rhs.to_csvec());
+        assert!(
+            diff.norm(1.0) < 1e-5,
+            "the factors do not invert the repaired matrix"
+        );
+    }
+}
+
 #[test]
 fn lu_rand() {
     init();
