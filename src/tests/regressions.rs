@@ -268,6 +268,33 @@ mod regression_tests {
         let gen_cost = [1.57, 8.12, 8.82, 8.04, 3.59, 2.49, 9.28, 8.04];
         let max_off = 1;
 
+        let problem = switchable_dc_network(&lines, &demand, &gen_max, &gen_cost, max_off);
+
+        let sol = problem
+            .solve()
+            .unwrap_or_else(|e| panic!("a feasible, bounded MILP must solve, got {e:?}"))
+            .into_solution()
+            .unwrap_or_else(|i| panic!("must finish without limits, got {i:?}"));
+
+        assert!(
+            (sol.objective() - 23.339329).abs() < 1e-4,
+            "objective {} does not match the 23.339329 HiGHS and SCIP prove optimal",
+            sol.objective()
+        );
+    }
+
+    /// The DC network with switchable lines of #48: free bus angles (the
+    /// reference bus fixed at 0), big-M on/off flow and angle-difference rows,
+    /// power balance, and at most `max_off` lines switched out. The angle
+    /// columns form a graph Laplacian, which is singular on any islanded
+    /// component, so a basis holding them can be singular in exact arithmetic.
+    fn switchable_dc_network(
+        lines: &[(usize, usize, f64, f64)],
+        demand: &[f64],
+        gen_max: &[f64],
+        gen_cost: &[f64],
+        max_off: usize,
+    ) -> Problem {
         let n = demand.len();
         let angle_max = 0.52;
         let big = angle_max * n as f64;
@@ -331,6 +358,69 @@ mod regression_tests {
         }
         let in_service: Vec<_> = on.iter().map(|&z| (z, 1.0)).collect();
         problem.add_constraint(in_service, ComparisonOp::Ge, (lines.len() - max_off) as f64);
+        problem
+    }
+
+    /// The instance the #48 reproducer was reduced from (8 buses, 17 lines, at
+    /// most 5 out), which still returned `InternalError("Singular matrix")` once
+    /// the reduced model solved: node refactorizations meet angle columns that
+    /// are dependent in exact arithmetic (the eliminated column's remaining
+    /// entries are 0 or ~1e-18 against O(1) entries), and the slack-basis retry
+    /// walks into another such basis. HiGHS and SCIP prove it optimal at
+    /// 21.8075893.
+    #[test]
+    fn issue_48_dependent_angle_columns_are_repaired() {
+        // (from, to, susceptance, rating)
+        let lines = [
+            (0, 1, 0.9686298722670136, 0.5159086902216787),
+            (1, 2, 77.65672082044843, 0.4939928028623229),
+            (2, 3, 10.169130409783925, 0.9171543544549055),
+            (2, 4, 0.24353226941823863, 1.1142552065264542),
+            (3, 5, 431.7932513885385, 0.5502874118216754),
+            (2, 6, 54.07609451644704, 0.7703205477817769),
+            (3, 7, 0.0570210914284091, 1.2198910114002925),
+            (0, 3, 0.028219851232626894, 0.3341353177211553),
+            (6, 1, 63.120711861451014, 0.8445073233521603),
+            (5, 7, 3.038181146448185, 0.5597594843730125),
+            (4, 1, 1108.6007058755886, 1.1718914389360113),
+            (7, 2, 19.951279087561925, 0.6460380028021542),
+            (1, 7, 0.679144011706049, 0.3342421133148527),
+            (1, 3, 0.33597139084608224, 0.47623702164777887),
+            (5, 1, 538.8110690717954, 0.7133186988309312),
+            (1, 2, 723.1137345077842, 0.4867759587010371),
+            (3, 4, 0.03831154932352043, 0.8318133029962747),
+        ];
+        let demand = [
+            0.4036697662900818,
+            0.3981077547694596,
+            0.8454397395074632,
+            0.9166091025923809,
+            0.1949576733383801,
+            0.14816136152591497,
+            0.5207541467834025,
+            0.6049229107789209,
+        ];
+        let gen_max = [
+            0.5312683583858417,
+            1.3560537746311734,
+            0.949931326082028,
+            0.29506776759372594,
+            0.5011483872361722,
+            0.9176571759886635,
+            0.22366540186097444,
+            0.6692481232625279,
+        ];
+        let gen_cost = [
+            1.5654758428312983,
+            8.12314026102617,
+            8.822580909574132,
+            8.037396275468748,
+            3.5908103494711483,
+            2.4903848261012254,
+            9.275024069585516,
+            8.03919882172724,
+        ];
+        let problem = switchable_dc_network(&lines, &demand, &gen_max, &gen_cost, 5);
 
         let sol = problem
             .solve()
@@ -339,8 +429,8 @@ mod regression_tests {
             .unwrap_or_else(|i| panic!("must finish without limits, got {i:?}"));
 
         assert!(
-            (sol.objective() - 23.339329).abs() < 1e-4,
-            "objective {} does not match the 23.339329 HiGHS and SCIP prove optimal",
+            (sol.objective() - 21.8075893).abs() < 1e-4,
+            "objective {} does not match the 21.8075893 HiGHS and SCIP prove optimal",
             sol.objective()
         );
     }
