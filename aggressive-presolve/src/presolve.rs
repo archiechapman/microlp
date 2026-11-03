@@ -545,11 +545,8 @@ impl Presolver<'_> {
             return Ok(());
         }
         let (lo, hi) = (self.rows[r].lo.value(), self.rows[r].hi.value());
-        let side_mag = lo
-            .abs()
-            .min(f64::MAX)
-            .max(if hi.is_finite() { hi.abs() } else { 0.0 });
-        let side_mag = if side_mag.is_finite() { side_mag } else { 0.0 };
+        let fin = |v: f64| if v.is_finite() { v.abs() } else { 0.0 };
+        let side_mag = fin(lo).max(fin(hi));
         if lo > hi + self.row_tol(side_mag) {
             return Err(infeasible(format!("row {r} has crossing sides")));
         }
@@ -776,10 +773,11 @@ impl Presolver<'_> {
             if self.cols[x].int {
                 // Keep every integer x whose x_j meets its bounds within their
                 // tolerance.
-                let tl = self.opts.feasibility.max(1e-14 * l.abs());
-                let tu = self.opts.feasibility.max(1e-14 * u.abs());
+                let fin = |v: f64| if v.is_finite() { v.abs() } else { 0.0 };
+                let tl = self.opts.feasibility.max(1e-14 * fin(l));
+                let tu = self.opts.feasibility.max(1e-14 * fin(u));
                 let m = (pivot.abs() * tl.max(tu)
-                    + self.row_tol(rhs_v.abs() + p_lo.abs().max(p_hi.abs()).min(f64::MAX)))
+                    + self.row_tol(fin(rhs_v) + fin(p_lo).max(fin(p_hi))))
                     / a.abs();
                 if xlo.is_finite() {
                     xlo -= m;
