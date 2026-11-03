@@ -1,0 +1,19 @@
+[package]
+name = "aggressive-presolve"
+version = "0.1.0"
+authors = ["Archie Chapman <archiechapman@gmail.com>"]
+edition = "2021"
+rust-version = "1.86"
+license = "Apache-2.0"
+description = "Aggressive MILP presolve with postsolve and an answer check, wrapping microlp."
+publish = false
+
+[dependencies]
+microlp = { path = ".." }
+flate2 = "1.1.9"
+
+[profile.test]
+opt-level = 3
+
+# Not a member of microlp's workspace.
+[workspace]
