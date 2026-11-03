@@ -41,3 +41,34 @@ fn long_row_of_fixed_terms_keeps_its_slack() {
     assert_eq!(ans.values.as_ref().unwrap()[y], 7.0);
     assert_eq!(ans.objective, Some(7.0));
 }
+
+/// The same model through microlp alone, with and without its own presolve,
+/// for the record (printed, not asserted: master's presolve is not this
+/// crate's to fix).
+#[test]
+fn long_row_through_microlp_alone() {
+    let n = 5000;
+    let c = 1666022.6166951393;
+    let (p, e) = two_prod(n as f64, c);
+    let b = p + (e + 7.0);
+    let mut m = Model::new(Direction::Maximize);
+    let y = m.add_int_var(1.0, 0.0, 100.0);
+    let mut terms = vec![(y, 1.0)];
+    for _ in 0..n {
+        let x = m.add_var(0.0, 1.0, 1.0);
+        terms.push((x, c));
+    }
+    m.add_le(&terms, b);
+    for microlp_presolve in [true, false] {
+        let mut o = Options::default();
+        o.presolve.enabled = false;
+        o.microlp_presolve = microlp_presolve;
+        let a = solve(&m, &o).unwrap();
+        println!(
+            "microlp alone, its presolve {}: {:?} {:?}",
+            if microlp_presolve { "on" } else { "off" },
+            a.status,
+            a.objective
+        );
+    }
+}
