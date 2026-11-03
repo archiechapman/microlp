@@ -1,6 +1,8 @@
 //! One test per reduction, and postsolve round trips.
 
-use aggressive_presolve::{check, presolve, CheckOptions, Direction, Model, PresolveOptions, Presolved};
+use aggressive_presolve::{
+    check, presolve, CheckOptions, Direction, Model, PresolveOptions, Presolved,
+};
 
 fn reduce(m: &Model) -> Presolved {
     presolve(m, &PresolveOptions::default()).expect("feasible")
@@ -199,8 +201,10 @@ fn substitution_respects_the_fill_in_cap() {
     let p = reduce(&m);
     assert_eq!(p.stats.substitutions, 0);
     assert!(p.stats.refused_fill > 0);
-    let mut loose = PresolveOptions::default();
-    loose.max_fill = 100;
+    let loose = PresolveOptions {
+        max_fill: 100,
+        ..Default::default()
+    };
     assert_eq!(presolve(&m, &loose).unwrap().stats.substitutions, 1);
 }
 
@@ -219,8 +223,10 @@ fn substitution_respects_the_ratio_growth_cap() {
     let p = reduce(&m);
     assert_eq!(p.stats.substitutions, 0);
     assert!(p.stats.refused_ratio > 0);
-    let mut loose = PresolveOptions::default();
-    loose.max_ratio_growth = f64::INFINITY;
+    let loose = PresolveOptions {
+        max_ratio_growth: f64::INFINITY,
+        ..Default::default()
+    };
     let p = presolve(&m, &loose).unwrap();
     assert_eq!(p.stats.substitutions, 1);
     assert!(p.stats.worst_ratio_after > 4.0 * p.stats.worst_ratio_before);
@@ -252,7 +258,10 @@ fn protected_rows_and_frozen_cols_are_left_alone() {
     o.protected_rows.insert(2);
     let p = presolve(&m, &o).unwrap();
     assert_eq!(p.stats.singleton_rows, 0);
-    assert_eq!(p.stats.doubletons, 1, "z is in a protected row, but y is not");
+    assert_eq!(
+        p.stats.doubletons, 1,
+        "z is in a protected row, but y is not"
+    );
     assert_eq!(p.reduced.rows.len(), 2);
     let mut o = PresolveOptions::default();
     o.frozen_cols.insert(y);

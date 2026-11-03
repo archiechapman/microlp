@@ -62,7 +62,10 @@ fn random_model(seed: u64) -> Model {
         let mut a = vec![0.0; n];
         let kind = rng.range(0, 4);
         match kind {
-            0 => a[rng.range(0, n as i32 - 1) as usize] = rng.range(1, 3) as f64 * [-1.0, 1.0][rng.range(0, 1) as usize],
+            0 => {
+                a[rng.range(0, n as i32 - 1) as usize] =
+                    rng.range(1, 3) as f64 * [-1.0, 1.0][rng.range(0, 1) as usize]
+            }
             1 => {
                 let i = rng.range(0, n as i32 - 1) as usize;
                 let j = (i + 1) % n;
@@ -76,7 +79,12 @@ fn random_model(seed: u64) -> Model {
             }
         }
         let rhs = rng.range(-4, 6) as f64;
-        let terms: Vec<(usize, f64)> = a.iter().enumerate().filter(|t| *t.1 != 0.0).map(|(j, &c)| (j, c)).collect();
+        let terms: Vec<(usize, f64)> = a
+            .iter()
+            .enumerate()
+            .filter(|t| *t.1 != 0.0)
+            .map(|(j, &c)| (j, c))
+            .collect();
         match rng.range(0, 3) {
             0 => m.add_le(&terms, rhs),
             1 => m.add_ge(&terms, rhs),
@@ -127,6 +135,8 @@ fn presolve_on_and_off_agree_and_points_check() {
             Path::NoPresolve => unreachable!(),
         }
     }
-    println!("{solved} optimal; paths: {reduced} presolved, {retried} retried, {fell_back} original");
+    println!(
+        "{solved} optimal; paths: {reduced} presolved, {retried} retried, {fell_back} original"
+    );
     assert!(solved > 500);
 }

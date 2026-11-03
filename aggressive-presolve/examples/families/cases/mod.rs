@@ -44,9 +44,12 @@ impl Case {
     }
 }
 
+#[allow(clippy::all)]
 #[path = "../../../../tests/suite/cases/milp_families.rs"]
 pub mod milp_families;
+#[allow(clippy::all)]
 #[path = "../../../../tests/suite/cases/milp_random.rs"]
 pub mod milp_random;
+#[allow(clippy::all)]
 #[path = "../../../../tests/suite/cases/milp_unit.rs"]
 pub mod milp_unit;

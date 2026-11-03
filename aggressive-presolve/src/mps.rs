@@ -478,6 +478,129 @@ fn sense(s: &str, ln: usize) -> Result<Direction, String> {
     }
 }
 
+/// Writes `model` as free MPS: integer columns inside `INTORG`/`INTEND`
+/// markers with explicit bounds, every number in the shortest form that reads
+/// back exactly. Names are replaced by `C<j>`/`R<i>` where they hold spaces.
+pub fn write(model: &Model) -> String {
+    use std::fmt::Write as _;
+    let clean = |s: &str, prefix: char, i: usize| {
+        if s.is_empty() || s.contains(char::is_whitespace) {
+            format!("{prefix}{i}")
+        } else {
+            s.to_string()
+        }
+    };
+    let cols: Vec<String> = model
+        .vars
+        .iter()
+        .enumerate()
+        .map(|(j, v)| clean(&v.name, 'C', j))
+        .collect();
+    let rows: Vec<String> = model
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| clean(&r.name, 'R', i))
+        .collect();
+    let mut by_col: Vec<Vec<(usize, f64)>> = vec![Vec::new(); model.vars.len()];
+    for (i, r) in model.rows.iter().enumerate() {
+        for &(j, a) in &r.terms {
+            by_col[j].push((i, a));
+        }
+    }
+    let mut s = String::new();
+    let _ = writeln!(
+        s,
+        "NAME {}",
+        if model.name.is_empty() {
+            "model"
+        } else {
+            &model.name
+        }
+    );
+    if model.direction == Direction::Maximize {
+        let _ = writeln!(s, "OBJSENSE\n    MAX");
+    }
+    let _ = writeln!(s, "ROWS\n N  OBJ");
+    for (i, r) in model.rows.iter().enumerate() {
+        let t = if r.lo == r.hi {
+            "E"
+        } else if r.lo == f64::NEG_INFINITY {
+            "L"
+        } else {
+            "G"
+        };
+        let _ = writeln!(s, " {t}  {}", rows[i]);
+    }
+    let _ = writeln!(s, "COLUMNS");
+    let mut in_int = false;
+    for (j, v) in model.vars.iter().enumerate() {
+        if v.is_integer() != in_int {
+            in_int = v.is_integer();
+            let m = if in_int { "INTORG" } else { "INTEND" };
+            let _ = writeln!(s, "    MARKER 'MARKER' '{m}'");
+        }
+        if v.cost != 0.0 || by_col[j].is_empty() {
+            let _ = writeln!(s, "    {} OBJ {:?}", cols[j], v.cost);
+        }
+        for &(i, a) in &by_col[j] {
+            let _ = writeln!(s, "    {} {} {:?}", cols[j], rows[i], a);
+        }
+    }
+    if in_int {
+        let _ = writeln!(s, "    MARKER 'MARKER' 'INTEND'");
+    }
+    let _ = writeln!(s, "RHS");
+    if model.obj_offset != 0.0 {
+        let _ = writeln!(s, "    RHS OBJ {:?}", -model.obj_offset);
+    }
+    for (i, r) in model.rows.iter().enumerate() {
+        let b = if r.lo == f64::NEG_INFINITY {
+            r.hi
+        } else {
+            r.lo
+        };
+        if b != 0.0 {
+            let _ = writeln!(s, "    RHS {} {:?}", rows[i], b);
+        }
+    }
+    let _ = writeln!(s, "RANGES");
+    for (i, r) in model.rows.iter().enumerate() {
+        if r.lo != r.hi && r.lo.is_finite() && r.hi.is_finite() {
+            let _ = writeln!(s, "    RNG {} {:?}", rows[i], r.hi - r.lo);
+        }
+    }
+    let _ = writeln!(s, "BOUNDS");
+    for (j, v) in model.vars.iter().enumerate() {
+        let c = &cols[j];
+        if v.lo == v.hi {
+            let _ = writeln!(s, " FX BND {c} {:?}", v.lo);
+            continue;
+        }
+        match (v.lo == f64::NEG_INFINITY, v.hi == f64::INFINITY) {
+            (true, true) => {
+                let _ = writeln!(s, " FR BND {c}");
+            }
+            (true, false) => {
+                let _ = writeln!(s, " MI BND {c}");
+                let _ = writeln!(s, " UP BND {c} {:?}", v.hi);
+            }
+            (false, inf_hi) => {
+                // Always explicit, so an integer column is never read binary
+                // by default and a negative UP never moves the lower bound.
+                let _ = writeln!(s, " LO BND {c} {:?}", v.lo);
+                if inf_hi {
+                    let _ = writeln!(s, " PL BND {c}");
+                } else {
+                    let _ = writeln!(s, " UP BND {c} {:?}", v.hi);
+                }
+            }
+        }
+    }
+    let _ = writeln!(s, "ENDATA");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,12 +684,9 @@ ENDATA
             }
             let t: Vec<String> = line
                 .split_whitespace()
-                .map(|w| {
-                    if w.starts_with('X') {
-                        format!("X {}", &w[1..])
-                    } else {
-                        w.to_string()
-                    }
+                .map(|w| match w.strip_prefix('X') {
+                    Some(rest) => format!("X {rest}"),
+                    None => w.to_string(),
                 })
                 .collect();
             if line.contains("MARKER") || section == "OBJSENSE" {
@@ -621,105 +741,4 @@ ENDATA
         let text = "NAME x\nROWS\n N obj\nCOLUMNS\nSOS\nENDATA\n";
         assert!(parse(text, &MpsOptions::default()).is_err());
     }
-}
-
-/// Writes `model` as free MPS: integer columns inside `INTORG`/`INTEND`
-/// markers with explicit bounds, every number in the shortest form that reads
-/// back exactly. Names are replaced by `C<j>`/`R<i>` where they hold spaces.
-pub fn write(model: &Model) -> String {
-    use std::fmt::Write as _;
-    let clean = |s: &str, prefix: char, i: usize| {
-        if s.is_empty() || s.contains(char::is_whitespace) {
-            format!("{prefix}{i}")
-        } else {
-            s.to_string()
-        }
-    };
-    let cols: Vec<String> = model.vars.iter().enumerate().map(|(j, v)| clean(&v.name, 'C', j)).collect();
-    let rows: Vec<String> = model.rows.iter().enumerate().map(|(i, r)| clean(&r.name, 'R', i)).collect();
-    let mut by_col: Vec<Vec<(usize, f64)>> = vec![Vec::new(); model.vars.len()];
-    for (i, r) in model.rows.iter().enumerate() {
-        for &(j, a) in &r.terms {
-            by_col[j].push((i, a));
-        }
-    }
-    let mut s = String::new();
-    let _ = writeln!(s, "NAME {}", if model.name.is_empty() { "model" } else { &model.name });
-    if model.direction == Direction::Maximize {
-        let _ = writeln!(s, "OBJSENSE\n    MAX");
-    }
-    let _ = writeln!(s, "ROWS\n N  OBJ");
-    for (i, r) in model.rows.iter().enumerate() {
-        let t = if r.lo == r.hi {
-            "E"
-        } else if r.lo == f64::NEG_INFINITY {
-            "L"
-        } else {
-            "G"
-        };
-        let _ = writeln!(s, " {t}  {}", rows[i]);
-    }
-    let _ = writeln!(s, "COLUMNS");
-    let mut in_int = false;
-    for (j, v) in model.vars.iter().enumerate() {
-        if v.is_integer() != in_int {
-            in_int = v.is_integer();
-            let m = if in_int { "INTORG" } else { "INTEND" };
-            let _ = writeln!(s, "    MARKER 'MARKER' '{m}'");
-        }
-        if v.cost != 0.0 || by_col[j].is_empty() {
-            let _ = writeln!(s, "    {} OBJ {:?}", cols[j], v.cost);
-        }
-        for &(i, a) in &by_col[j] {
-            let _ = writeln!(s, "    {} {} {:?}", cols[j], rows[i], a);
-        }
-    }
-    if in_int {
-        let _ = writeln!(s, "    MARKER 'MARKER' 'INTEND'");
-    }
-    let _ = writeln!(s, "RHS");
-    if model.obj_offset != 0.0 {
-        let _ = writeln!(s, "    RHS OBJ {:?}", -model.obj_offset);
-    }
-    for (i, r) in model.rows.iter().enumerate() {
-        let b = if r.lo == f64::NEG_INFINITY { r.hi } else { r.lo };
-        if b != 0.0 {
-            let _ = writeln!(s, "    RHS {} {:?}", rows[i], b);
-        }
-    }
-    let _ = writeln!(s, "RANGES");
-    for (i, r) in model.rows.iter().enumerate() {
-        if r.lo != r.hi && r.lo.is_finite() && r.hi.is_finite() {
-            let _ = writeln!(s, "    RNG {} {:?}", rows[i], r.hi - r.lo);
-        }
-    }
-    let _ = writeln!(s, "BOUNDS");
-    for (j, v) in model.vars.iter().enumerate() {
-        let c = &cols[j];
-        if v.lo == v.hi {
-            let _ = writeln!(s, " FX BND {c} {:?}", v.lo);
-            continue;
-        }
-        match (v.lo == f64::NEG_INFINITY, v.hi == f64::INFINITY) {
-            (true, true) => {
-                let _ = writeln!(s, " FR BND {c}");
-            }
-            (true, false) => {
-                let _ = writeln!(s, " MI BND {c}");
-                let _ = writeln!(s, " UP BND {c} {:?}", v.hi);
-            }
-            (false, inf_hi) => {
-                // Always explicit, so an integer column is never read binary
-                // by default and a negative UP never moves the lower bound.
-                let _ = writeln!(s, " LO BND {c} {:?}", v.lo);
-                if inf_hi {
-                    let _ = writeln!(s, " PL BND {c}");
-                } else {
-                    let _ = writeln!(s, " UP BND {c} {:?}", v.hi);
-                }
-            }
-        }
-    }
-    let _ = writeln!(s, "ENDATA");
-    s
 }

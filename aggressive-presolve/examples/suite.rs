@@ -79,14 +79,20 @@ fn collect(root: &Path, filter: &Option<String>) -> Vec<Instance> {
     let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
             let p = e.path();
             if p.is_dir() {
                 stack.push(p);
             } else {
                 let n = p.file_name().unwrap().to_string_lossy().to_string();
-                if n.ends_with(".mps") || n.ends_with(".mps.gz") || n.ends_with(".lp") || n.ends_with(".lp.gz") {
+                if n.ends_with(".mps")
+                    || n.ends_with(".mps.gz")
+                    || n.ends_with(".lp")
+                    || n.ends_with(".lp.gz")
+                {
                     files.push(p);
                 }
             }
@@ -98,8 +104,7 @@ fn collect(root: &Path, filter: &Option<String>) -> Vec<Instance> {
     for p in files {
         let fname = p.file_name().unwrap().to_string_lossy().to_string();
         let stem = fname.split('.').next().unwrap().to_string();
-        let tier = p.components().rev().nth(2).map(|c| c.as_os_str().to_string_lossy().to_string()).unwrap_or_default();
-        if tier == "xhard" {
+        if p.components().any(|c| c.as_os_str() == "xhard") {
             continue; // beyond microlp's ceiling, 10-minute budgets
         }
         if let Some(f) = filter {
@@ -123,8 +128,14 @@ fn collect(root: &Path, filter: &Option<String>) -> Vec<Instance> {
 /// `<name>.known` holding the optimum (or `infeasible`).
 fn collect_families(dir: &Path, filter: &Option<String>) -> Vec<Instance> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir(dir) else { return out };
-    let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "mps")).collect();
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    let mut paths: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "mps"))
+        .collect();
     paths.sort();
     for p in paths {
         let stem = p.file_stem().unwrap().to_string_lossy().to_string();
@@ -150,6 +161,9 @@ fn collect_families(dir: &Path, filter: &Option<String>) -> Vec<Instance> {
     out
 }
 
+/// Rows, cols and integer cols of an instance, and its three runs.
+type Row3 = (usize, usize, usize, [RunResult; 3]);
+
 #[derive(Clone)]
 struct RunResult {
     status: String,
@@ -173,7 +187,22 @@ enum Verdict {
     Unknown,
 }
 
-fn judge(inst: &Instance, ans: &Result<Answer, String>, dir_max: bool) -> Verdict {
+/// The objective at `x` with every integer var rounded, where that point
+/// still meets the model: an objective that misses the known value only by
+/// integer vars off their integers within `int_tol` is judged on this.
+fn rounded_objective(model: &Model, x: &[f64]) -> Option<f64> {
+    let r: Vec<f64> = model
+        .vars
+        .iter()
+        .zip(x)
+        .map(|(v, &x)| if v.is_integer() { x.round() } else { x })
+        .collect();
+    aggressive_presolve::check(model, &r, &Default::default())
+        .ok()
+        .then(|| model.objective(&r))
+}
+
+fn judge(inst: &Instance, model: &Model, ans: &Result<Answer, String>, dir_max: bool) -> Verdict {
     let Ok(ans) = ans else { return Verdict::Fail };
     if ans.check.as_ref().is_some_and(|c| !c.ok()) {
         return Verdict::Fail;
@@ -181,7 +210,13 @@ fn judge(inst: &Instance, ans: &Result<Answer, String>, dir_max: bool) -> Verdic
     let Some(expected) = inst.value else {
         return Verdict::Unknown;
     };
-    let close = |o: f64, v: f64| (o - v).abs() <= inst.abs.max(inst.rel * v.abs());
+    // The suite's rule: |o - v| <= abs + rel·|v|.
+    let near = |o: f64, v: f64| (o - v).abs() <= inst.abs + inst.rel * v.abs();
+    let rounded = ans
+        .values
+        .as_ref()
+        .and_then(|x| rounded_objective(model, x));
+    let close = |o: f64, v: f64| near(o, v) || rounded.is_some_and(|r| near(r, v));
     match (expected, ans.status) {
         (Some(v), Status::Unbounded) if v.is_nan() => Verdict::Pass,
         (Some(v), Status::NoSolution) if v.is_nan() => Verdict::Timeout,
@@ -222,15 +257,26 @@ fn run(model: &Model, inst: &Instance, mode: usize, limit: Duration) -> RunResul
         _ => opts.microlp_presolve = false,
     }
     let ans = solve(model, &opts).map_err(|e| e.to_string());
-    let verdict = judge(inst, &ans, model.direction == aggressive_presolve::Direction::Maximize);
+    let verdict = judge(
+        inst,
+        model,
+        &ans,
+        model.direction == aggressive_presolve::Direction::Maximize,
+    );
     match ans {
         Ok(a) => RunResult {
             status: format!("{:?}", a.status),
             objective: a.objective,
             time: a.time.as_secs_f64(),
             nodes: a.nodes,
-            rows_after: a.presolve_stats.as_ref().map_or(model.rows.len(), |s| s.rows_after),
-            cols_after: a.presolve_stats.as_ref().map_or(model.vars.len(), |s| s.cols_after),
+            rows_after: a
+                .presolve_stats
+                .as_ref()
+                .map_or(model.rows.len(), |s| s.rows_after),
+            cols_after: a
+                .presolve_stats
+                .as_ref()
+                .map_or(model.vars.len(), |s| s.cols_after),
             path: match &a.path {
                 aggressive_presolve::Path::NoPresolve => "-".into(),
                 aggressive_presolve::Path::Presolved => "presolved".into(),
@@ -271,10 +317,12 @@ fn main() {
     }
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut insts = collect(&crate_dir.join("../tests/suite/data"), &filter);
-    insts.extend(collect_families(&crate_dir.join("target/families"), &filter));
+    insts.extend(collect_families(
+        &crate_dir.join("target/families"),
+        &filter,
+    ));
     let insts = Arc::new(insts);
-    let results: Arc<Mutex<Vec<Option<(usize, usize, usize, [RunResult; 3])>>>> =
-        Arc::new(Mutex::new(vec![None; insts.len()]));
+    let results: Arc<Mutex<Vec<Option<Row3>>>> = Arc::new(Mutex::new(vec![None; insts.len()]));
     let next = Arc::new(Mutex::new(0usize));
     let limit = Duration::from_secs_f64(limit);
     let mut handles = Vec::new();
@@ -298,12 +346,25 @@ fn main() {
                     continue;
                 }
             };
-            let r = [run(&model, inst, 0, limit), run(&model, inst, 1, limit), run(&model, inst, 2, limit)];
+            let r = [
+                run(&model, inst, 0, limit),
+                run(&model, inst, 1, limit),
+                run(&model, inst, 2, limit),
+            ];
             eprintln!(
                 "{:<28} {:>9.3}s {:?} | {:>9.3}s {:?} {} | {:>9.3}s {:?} {}",
-                inst.name, r[0].time, r[0].verdict, r[1].time, r[1].verdict, r[1].path, r[2].time, r[2].verdict, r[2].path
+                inst.name,
+                r[0].time,
+                r[0].verdict,
+                r[1].time,
+                r[1].verdict,
+                r[1].path,
+                r[2].time,
+                r[2].verdict,
+                r[2].path
             );
-            results.lock().unwrap()[i] = Some((model.rows.len(), model.vars.len(), model.num_integer(), r));
+            results.lock().unwrap()[i] =
+                Some((model.rows.len(), model.vars.len(), model.num_integer(), r));
         }));
     }
     for h in handles {
@@ -311,7 +372,11 @@ fn main() {
     }
     let results = results.lock().unwrap();
     let mut md = String::new();
-    let labels = ["microlp alone", "aggressive + microlp", "aggressive, microlp presolve off"];
+    let labels = [
+        "microlp alone",
+        "aggressive + microlp",
+        "aggressive, microlp presolve off",
+    ];
     let mut counts = [[0usize; 4]; 3];
     for (_, _, _, r) in results.iter().flatten() {
         for k in 0..3 {
@@ -324,9 +389,18 @@ fn main() {
             counts[k][idx] += 1;
         }
     }
-    writeln!(md, "| path | pass | timeout | fail | no known value |\n|---|---|---|---|---|").unwrap();
+    writeln!(
+        md,
+        "| path | pass | timeout | fail | no known value |\n|---|---|---|---|---|"
+    )
+    .unwrap();
     for k in 0..3 {
-        writeln!(md, "| {} | {} | {} | {} | {} |", labels[k], counts[k][0], counts[k][1], counts[k][2], counts[k][3]).unwrap();
+        writeln!(
+            md,
+            "| {} | {} | {} | {} | {} |",
+            labels[k], counts[k][0], counts[k][1], counts[k][2], counts[k][3]
+        )
+        .unwrap();
     }
     writeln!(
         md,

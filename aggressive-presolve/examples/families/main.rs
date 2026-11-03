@@ -11,10 +11,13 @@
 
 #![allow(dead_code)]
 
+#[allow(clippy::all)]
 #[path = "model.rs"]
 mod model;
+#[allow(clippy::all)]
 #[path = "../../../tests/suite/oracles.rs"]
 mod oracles;
+#[allow(clippy::all)]
 #[path = "../../../tests/suite/rng.rs"]
 mod rng;
 
@@ -103,5 +106,8 @@ fn main() {
         std::fs::write(dir.join(format!("{stem}.known")), known).unwrap();
         written += 1;
     }
-    println!("wrote {written} instances to {}, skipped {skipped} custom cases", dir.display());
+    println!(
+        "wrote {written} instances to {}, skipped {skipped} custom cases",
+        dir.display()
+    );
 }
