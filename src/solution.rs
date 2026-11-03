@@ -9,6 +9,7 @@ use crate::{
     ResumeOptions, SolutionStatus, SolveOptions, SolveOutcome, Stats, TerminationReason, VarDomain,
     Variable,
 };
+use std::sync::OnceLock;
 
 #[derive(Clone)]
 pub(crate) enum SolveState {
@@ -51,6 +52,10 @@ pub struct Solution {
     /// (`Solver::duals`). Empty for a MIP.
     pub(crate) lp_duals: Vec<f64>,
     pub(crate) lp_reduced_costs: Vec<f64>,
+    /// For a solution of the branch & bound search, the duals and reduced
+    /// costs of its final LP (`mip::final_lp_duals`), solved on the first
+    /// request.
+    pub(crate) mip_duals: OnceLock<Option<(Vec<f64>, Vec<f64>)>>,
 }
 
 impl From<&SolveOptions> for ResumeOptions {
@@ -190,8 +195,18 @@ impl Solution {
     /// Returns a constraint's dual value (shadow price): the rate at which the
     /// optimal objective changes as the constraint's right-hand side
     /// increases, in the objective's units per unit of the right-hand side.
-    /// `None` for a problem with integer or boolean variables, whose
-    /// solutions carry no duals.
+    ///
+    /// For a problem that solves through branch & bound (one with integer or
+    /// boolean variables, or special ordered sets), they are the duals of the
+    /// final LP: the problem with its integer variables fixed at this
+    /// solution's integers, and the special-ordered-set members that are zero
+    /// here held at zero. That LP is solved once, on the first call to any of
+    /// [`Solution::dual`], [`Solution::duals`] or [`Solution::reduced_cost`].
+    /// They price the solution's integer choices and set pattern as fixed:
+    /// for a piecewise-linear function under SOS2, the segment the solution
+    /// lies on. `None` where that LP does not solve to optimality, which an
+    /// integer variable just off its integer under a big-M coefficient can
+    /// cause.
     ///
     /// The sign follows from that definition. When minimizing, a
     /// [`ComparisonOp::Le`] constraint's dual is at most zero and a
@@ -246,13 +261,23 @@ impl Solution {
 
     /// Returns the dual of every constraint, indexed by [`Constraint::idx`]:
     /// the problem's constraints in the order added, then those
-    /// [`Solution::add_constraint`] added. `None` for a problem with integer
-    /// or boolean variables. See [`Solution::dual`].
+    /// [`Solution::add_constraint`] added. See [`Solution::dual`], also for
+    /// when it is `None`.
     pub fn duals(&self) -> Option<&[f64]> {
         match &self.state {
             SolveState::Lp(_) => Some(&self.lp_duals),
-            SolveState::Mip(_) => None,
+            SolveState::Mip(_) => self.final_lp_duals().map(|(duals, _)| &duals[..]),
         }
+    }
+
+    /// The duals and reduced costs of a branch & bound solution's final LP.
+    fn final_lp_duals(&self) -> Option<&(Vec<f64>, Vec<f64>)> {
+        let SolveState::Mip(state) = &self.state else {
+            return None;
+        };
+        self.mip_duals
+            .get_or_init(|| mip::final_lp_duals(state))
+            .as_ref()
     }
 
     /// Returns a variable's reduced cost: the rate at which the objective
@@ -260,8 +285,10 @@ impl Solution {
     /// variables at their bounds held there, in the objective's units per
     /// unit of the variable. It equals the variable's objective coefficient
     /// less the sum, over the constraints, of its coefficient times the
-    /// constraint's [dual](Solution::dual). `None` for a problem with integer
-    /// or boolean variables.
+    /// constraint's [dual](Solution::dual). For a problem that solves through
+    /// branch & bound, it is that of the final LP (see [`Solution::dual`],
+    /// also for when it is `None`): there an integer variable, fixed at its
+    /// integer, gets the marginal value of that fix.
     ///
     /// A variable strictly between its bounds has reduced cost zero, within
     /// the tolerances; one at a bound, the marginal value of that bound (when
@@ -277,7 +304,9 @@ impl Solution {
         assert!(var.0 < self.num_vars);
         match &self.state {
             SolveState::Lp(_) => Some(self.lp_reduced_costs[var.0]),
-            SolveState::Mip(_) => None,
+            SolveState::Mip(_) => self
+                .final_lp_duals()
+                .map(|(_, reduced_costs)| reduced_costs[var.0]),
         }
     }
 
@@ -541,6 +570,7 @@ impl Solution {
                             lp_objective: 0.0,
                             lp_duals: Vec::new(),
                             lp_reduced_costs: Vec::new(),
+                            mip_duals: OnceLock::new(),
                         }),
                         false,
                     ));

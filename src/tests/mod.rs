@@ -25,3 +25,8 @@ mod presolve_api;
 
 #[cfg(test)]
 mod duals;
+
+mod sos;
+
+#[cfg(test)]
+mod sos_pricing;

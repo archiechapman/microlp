@@ -102,6 +102,7 @@ impl SolveOutcome {
                     lp_objective,
                     lp_duals,
                     lp_reduced_costs,
+                    mip_duals: std::sync::OnceLock::new(),
                     state: SolveState::Lp(solver),
                     last_options,
                 }))
@@ -138,6 +139,7 @@ impl SolveOutcome {
                     lp_objective: 0.0,
                     lp_duals: Vec::new(),
                     lp_reduced_costs: Vec::new(),
+                    mip_duals: std::sync::OnceLock::new(),
                 })
             }
             TerminationReason::MipGap => {
@@ -153,6 +155,7 @@ impl SolveOutcome {
                     lp_objective: 0.0,
                     lp_duals: Vec::new(),
                     lp_reduced_costs: Vec::new(),
+                    mip_duals: std::sync::OnceLock::new(),
                 })
             }
             TerminationReason::TimeLimit | TerminationReason::NodeLimit if has_incumbent => {
@@ -167,6 +170,7 @@ impl SolveOutcome {
                     lp_objective: 0.0,
                     lp_duals: Vec::new(),
                     lp_reduced_costs: Vec::new(),
+                    mip_duals: std::sync::OnceLock::new(),
                 })
             }
             TerminationReason::TimeLimit | TerminationReason::NodeLimit => {

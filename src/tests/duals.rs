@@ -412,16 +412,21 @@ fn an_edit_numbers_its_row_after_the_problems() {
     assert!((solution.duals().unwrap()[1] + 30.0).abs() < 1e-9);
 }
 
+/// A MILP's duals are those of its final LP, `n` fixed at its integer:
+/// `n = 7`, `x = 0.5`; one more unit of the row goes to `x`, worth 1, and the
+/// fix of `n` is worth its 2 less the 1 its unit of the row costs.
 #[test]
-fn a_mip_has_no_duals() {
+fn a_mip_is_priced_by_its_final_lp() {
     let mut problem = Problem::new(OptimizationDirection::Maximize);
     let x = problem.add_var(1.0, (0.0, 2.5));
     let n = problem.add_integer_var(2.0, (0, 10));
     let c = problem.add_constraint(&[(x, 1.0), (n, 1.0)], ComparisonOp::Le, 7.5);
     let solution = problem.solve().unwrap().into_solution().unwrap();
-    assert_eq!(solution.dual(c), None);
-    assert_eq!(solution.duals(), None);
-    assert_eq!(solution.reduced_cost(x), None);
+    assert!((solution.objective() - 14.5).abs() < 1e-9);
+    assert!((solution.dual(c).unwrap() - 1.0).abs() < 1e-9);
+    assert_eq!(solution.duals().unwrap().len(), 1);
+    assert!(solution.reduced_cost(x).unwrap().abs() < 1e-9);
+    assert!((solution.reduced_cost(n).unwrap() - 1.0).abs() < 1e-9);
 }
 
 #[test]

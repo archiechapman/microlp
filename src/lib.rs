@@ -14,11 +14,16 @@ higher-level ways to write models.
 
 * Pure Rust. Runs on WebAssembly.
 * Real, integer, and boolean variables.
+* Special ordered sets of type 1 and 2 ([`Problem::add_sos1_constraint`],
+  [`Problem::add_sos2_constraint`]), such as piecewise-linear functions that
+  need not be convex.
+* Duals and reduced costs ([`Solution::dual`], [`Solution::reduced_cost`]).
 * Time limits and MIP gap, with the possibility to edit and resume a solve.
 * Warm starts from a known solution.
 * Handles problems with hundreds of thousands of variables and constraints.
 
-Integer and boolean variables are handled with branch & bound. On some hard or
+Integer and boolean variables, and special ordered sets, are handled with
+branch & bound. On some hard or
 ill-conditioned problems a solve can still fail with [`Error::InternalError`]
 rather than answer.
 
@@ -121,11 +126,13 @@ bearing in mind that rounded values need not meet the constraints: under
 `x <= 1e7 * y`, a `y` of `1e-6` allows `x` up to 10, which `y` rounded to zero
 forbids.
 
-For a problem without integer or boolean variables, [`Solution::dual`] reports
-a constraint's dual value (shadow price), by the [`Constraint`] handle
-[`Problem::add_constraint`] returns: the rate at which the optimal objective
-changes as the constraint's right-hand side increases.
-[`Solution::reduced_cost`] reports a variable's reduced cost.
+[`Solution::dual`] reports a constraint's dual value (shadow price), by the
+[`Constraint`] handle [`Problem::add_constraint`] returns: the rate at which
+the optimal objective changes as the constraint's right-hand side increases.
+[`Solution::reduced_cost`] reports a variable's reduced cost. For a problem
+solved through branch & bound they are those of the final LP, with the integer
+variables fixed at the solution's integers and the special-ordered-set members
+that are zero held at zero.
 
 # Known limitations
 

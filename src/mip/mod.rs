@@ -16,6 +16,7 @@ pub(crate) mod node;
 mod options;
 pub(crate) mod params;
 mod search;
+pub(crate) mod sos;
 mod state;
 
 pub use options::{
@@ -35,7 +36,19 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
     // Presolve what the search solves; `state.base` stays the user's problem,
     // so post-solve edits keep composing against it. The presolved bounds
     // become the root bounds. Dual fixing can exclude a feasible point, so a
-    // warm-start hint disables it, as does `SolveOptions::dual_fixing`.
+    // warm-start hint disables it, as does `SolveOptions::dual_fixing`. It
+    // reads only the rows, which do not hold a special ordered set: an
+    // integer member nothing in the rows stops was fixed at a nonzero bound,
+    // two in one SOS1 contradicting it. So a set with an integer member
+    // disables it too; dual fixing never touches a continuous var.
+    let sets_lock_integers = problem.sos.iter().any(|set| {
+        set.members.iter().any(|&v| {
+            matches!(
+                problem.var_domains[v],
+                VarDomain::Integer | VarDomain::Boolean
+            )
+        })
+    });
     let presolved = if options.presolve {
         crate::presolve::reduced_model(crate::presolve::presolve(
             &problem.obj_coeffs,
@@ -46,7 +59,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
             crate::presolve::Mode::Mip,
             options.tolerances.feasibility,
             options.int_tol,
-            options.dual_fixing && options.warm_start.is_none(),
+            options.dual_fixing && options.warm_start.is_none() && !sets_lock_integers,
         ))?
     } else {
         None
@@ -201,16 +214,19 @@ pub(crate) fn incumbent_feasible(
     int_tol: f64,
 ) -> bool {
     let feasibility = tolerances.feasibility;
-    candidate_variables_feasible(values, &base.var_domains, feasibility, int_tol, |v| {
+    let bounds = |v: usize| {
         fixed
             .get(&v)
             .map_or((base.var_mins[v], base.var_maxs[v]), |&value| {
                 (value, value)
             })
-    }) && base.constraints.iter().all(|(coeffs, op, rhs)| {
-        crate::solver::row_violation(coeffs, *op, *rhs, |v| values[v], tolerances.feasibility)
-            .is_none()
-    })
+    };
+    candidate_variables_feasible(values, &base.var_domains, feasibility, int_tol, bounds)
+        && sos::values_satisfy(&base.sos, values, feasibility, bounds)
+        && base.constraints.iter().all(|(coeffs, op, rhs)| {
+            crate::solver::row_violation(coeffs, *op, *rhs, |v| values[v], tolerances.feasibility)
+                .is_none()
+        })
 }
 
 /// After a user edit: drop the open tree, carry the incumbent as a warm-start
@@ -250,6 +266,53 @@ pub(crate) fn reedit_and_resolve(state: Box<MipState>) -> Result<MipRun, Error> 
     run.state.base = base;
     run.state.fixed = fixed;
     Ok(run)
+}
+
+/// The duals and reduced costs (user units and direction) of a search's final
+/// LP: the problem as edited, its integer vars fixed at the integers of the
+/// incumbent and the members of its special ordered sets that count as zero
+/// there (within the bound contract, `sos::zero_members`) held at zero,
+/// solved as a pure LP. A member whose bounds exclude zero keeps them. `None`
+/// with no incumbent, or where that LP does not solve to optimality: the
+/// incumbent's continuous values lie within the contract of it, but its
+/// integer vars within `int_tol` of their integers, so at those integers
+/// exactly it can be infeasible.
+pub(crate) fn final_lp_duals(state: &MipState) -> Option<(Vec<f64>, Vec<f64>)> {
+    let incumbent = state.incumbent.as_ref()?;
+    let mut lp = effective_problem(&state.base, &state.fixed);
+    let zero = sos::zero_members(
+        &lp.sos,
+        &incumbent.values,
+        state.options.tolerances.feasibility,
+        |v| (lp.var_mins[v], lp.var_maxs[v]),
+    );
+    for v in zero {
+        if lp.var_mins[v] <= 0.0 && 0.0 <= lp.var_maxs[v] {
+            lp.var_mins[v] = 0.0;
+            lp.var_maxs[v] = 0.0;
+        }
+    }
+    for v in 0..lp.var_domains.len() {
+        if matches!(lp.var_domains[v], VarDomain::Integer | VarDomain::Boolean) {
+            let value = incumbent.values[v].round();
+            lp.var_mins[v] = value;
+            lp.var_maxs[v] = value;
+            lp.var_domains[v] = VarDomain::Real;
+        }
+    }
+    lp.sos.clear();
+    let options = SolveOptions {
+        time_limit: None,
+        node_limit: None,
+        warm_start: None,
+        ..state.options.clone()
+    };
+    let solution = lp.solve_with(options).ok()?.into_solution().ok()?;
+    let duals = solution.duals()?.to_vec();
+    let reduced_costs = (0..lp.obj_coeffs.len())
+        .map(|v| solution.reduced_cost(Variable(v)))
+        .collect::<Option<Vec<f64>>>()?;
+    Some((duals, reduced_costs))
 }
 
 /// Continue a paused search with fresh per-call budgets and options.
