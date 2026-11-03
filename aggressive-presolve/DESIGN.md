@@ -58,8 +58,14 @@ reported by `to_problem` as an error rather than silently clamped).
   column with no `LO` sets the lower bound to `-inf` (with a warning, the
   classic MPSX rule). SOS, QUADOBJ, SC bounds and other unsupported sections
   are errors, never guessed at. `.gz` files are read through `flate2`.
-- **CPLEX LP**, if time allows: objective, `Subject To`, `Bounds`,
-  `General`/`Integer`, `Binary`, `End`.
+- **CPLEX LP** (`lp.rs`): objective (`Minimize`/`Maximize`, an optional
+  label, a constant), `Subject To` (`[name:] expr op rhs` and ranged
+  `lo op expr op hi`), `Bounds` (`x op v`, `v op x`, `lo <= x <= hi`,
+  `x free`, `x = v`), `General`/`Integer`, `Binary`, `End`; comments start
+  with `\`. Enough for the suite's CFL files; semi-continuous and SOS
+  sections are errors.
+- **MPS writer** (`mps::write`): free MPS that reads back exactly, used to
+  export the suite's Rust-built families.
 
 ## Reductions
 
@@ -71,8 +77,8 @@ remaining columns and an offset). Iterated to a fixpoint (pass cap 100):
 | reduction | soundness | integer rule |
 |---|---|---|
 | empty row | `0 ∈ [lo, hi]` or the model is infeasible | — |
-| singleton row `lo <= a·x <= hi` | equivalent to a bound on `x` | integer `x`: the bound is relaxed outward by the row's contract over `|a|` and then rounded inward, so every integral `x` that meets the row within its tolerance stays |
-| redundant row | activity bounds (with round-off allowance) lie inside `[lo, hi]` | — |
+| singleton row `lo <= a·x <= hi` | equivalent to a bound on `x`; a continuous bound is `side/a`, not relaxed, so the bound microlp holds is the row as written (up to `|a|·bound_tol`, which the check judges) | integer `x`: the bound is relaxed outward by the row's contract over `|a|` and then rounded inward, so every integral `x` that meets the row within its tolerance stays |
+| redundant row | activity bounds, widened by the allowance and by `Σ|a_j|·bound_tol_j` (a var may sit off its bound by its tolerance), lie inside `[lo, hi]` within the row's contract; so `x + y <= 2` over binaries stays, since it has no room for that | — |
 | forcing row | the extreme activity equals the side, so every var sits at the bound attaining it | an integer var is fixed only when its coefficient is larger than the room the round-off allowance leaves (it cannot move by a whole unit) |
 | integer bound tightening | implied bounds from the row and the other vars' bounds | relaxed outward by the row's contract over `|a|` and the allowance, then rounded |
 | fixed column | substituted into every row (in compensated arithmetic) and the objective constant | — |
@@ -95,10 +101,12 @@ it was measured slower on the case118 ROP model and dropped (history `dd276a2`).
   larger of that row's ratio as written and the pivot row's ratio as written.
   The bound is against the *original* ratios, so repeated substitutions cannot
   compound it. (The old version grew the worst ratio about 10× with nothing to
-  bound it.) The same cap applies to the objective-free rows only; the
-  objective is not checked.
+  bound it.) The objective is not held to the cap.
 - **Cancellation**: a coefficient that cancels to `<= 1e-12` of the magnitudes
   it was computed from is dropped.
+- **Choice**: among the columns that pass, the fewest added nonzeros first,
+  then a pivot that is the row's largest coefficient, then the fewest rows;
+  the ratio cap is tried in that order.
 
 ### Summation
 
