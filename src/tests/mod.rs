@@ -30,3 +30,6 @@ mod sos;
 
 #[cfg(test)]
 mod sos_pricing;
+
+#[cfg(test)]
+mod sos_losses;
