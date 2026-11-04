@@ -809,3 +809,71 @@ fn mixed_scale_branching_does_not_prune_the_true_optimum() {
     let solution = expect_solution(problem.solve().expect("fixture is bounded and feasible"));
     assert_solution(&case, &vars, 2_505, expected, &solution);
 }
+
+/// Reliability branching probes children before the search branches, which
+/// changes the tree and nothing else: the optimum and the infeasible verdict
+/// still match the enumeration, probes stay within their budget, and a
+/// search sliced by the node limit, its root alone then a node a call, ends
+/// on the optimum, since probes solve no node.
+#[test]
+fn reliability_branching_matches_exhaustive_enumeration() {
+    let mut probed = 0;
+    for seed in 0..20_000 {
+        let case = generated_case(seed);
+        let expected = brute_force(&case);
+        let (problem, vars, mut options) = build_problem(&case, None);
+        options.strong_branch_reliability = 4;
+        match (expected, problem.solve_with(options.clone())) {
+            (None, Err(Error::Infeasible)) => {}
+            (None, other) => panic!("seed {seed}: expected infeasible, got {other:?}; {case:?}"),
+            (Some((objective, _)), Ok(outcome)) => {
+                let lps = outcome.stats().strong_branch_lps;
+                assert!(lps <= 20 * case.n as u64, "seed {seed}: {lps} probes");
+                probed += u64::from(lps > 0);
+                let solution = expect_solution(outcome);
+                assert_solution(&case, &vars, seed, objective, &solution);
+                if seed % 25 == 0 {
+                    options.node_limit = Some(0);
+                    let mut sliced = problem.solve_with(options).unwrap();
+                    let mut one_node = ResumeOptions::default();
+                    one_node.node_limit = Some(1);
+                    for _ in 0..10_000 {
+                        if sliced.is_optimal() {
+                            break;
+                        }
+                        sliced = sliced.resume_with(one_node.clone()).unwrap();
+                    }
+                    assert_solution(&case, &vars, seed, objective, &expect_solution(sliced));
+                }
+            }
+            (Some(expected), other) => {
+                panic!("seed {seed}: expected {expected:?}, got {other:?}; {case:?}")
+            }
+        }
+    }
+    assert!(probed >= 400, "only {probed} searches probed");
+
+    for seed in 0..10_000 {
+        let case = generated_mixed_case(seed);
+        let expected = mixed_oracle(&case);
+        let (problem, _) = build_mixed_problem(&case);
+        let mut options = SolveOptions::default();
+        options.strong_branch_reliability = 4;
+        match (expected, problem.solve_with(options)) {
+            (None, Err(Error::Infeasible)) => {}
+            (None, other) => panic!("seed {seed}: expected infeasible, got {other:?}; {case:?}"),
+            (Some((objective, _, _)), Ok(outcome)) => {
+                let solution = expect_solution(outcome);
+                assert!(
+                    (solution.objective() - objective).abs()
+                        < 1e-6 + int_tol() * mixed_objective_reach(&case),
+                    "seed {seed}: objective {}, expected {objective}; {case:?}",
+                    solution.objective()
+                );
+            }
+            (Some(expected), other) => {
+                panic!("seed {seed}: expected {expected:?}, got {other:?}; {case:?}")
+            }
+        }
+    }
+}

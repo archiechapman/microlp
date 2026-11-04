@@ -33,3 +33,6 @@ mod sos_pricing;
 
 #[cfg(test)]
 mod sos_losses;
+
+#[cfg(test)]
+mod strong_branching;

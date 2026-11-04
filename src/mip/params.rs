@@ -51,3 +51,17 @@ pub(crate) const GAP_DENOM_GUARD: f64 = 1e-10;
 /// this constant only forgives noise in the hint value itself, never a real
 /// out-of-bounds input.
 pub(crate) const HINT_BOUNDS_SLACK: f64 = 1e-9;
+
+/// Most candidates one node strong-branches, the best by pseudocost score
+/// first (`branching::select_branch_var`): probing every fractional variable
+/// would cost more than the branching decision is worth.
+pub(crate) const SB_MAX_CANDIDATES: usize = 8;
+
+/// Simplex iterations one strong-branching probe may take. A probe is a
+/// warm-started dual solve of a child one bound away from its node, which
+/// normally ends well inside this; one that reaches it is not recorded.
+pub(crate) const SB_MAX_ITERS_PER_LP: u64 = 100;
+
+/// Strong-branching probes allowed in one search, per integer variable: a
+/// backstop for models whose pseudocosts never become reliable.
+pub(crate) const SB_BUDGET_PER_INT_VAR: u64 = 20;

@@ -115,6 +115,13 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         direction: problem.direction,
         objective_lattice,
         pseudocosts,
+        sb_budget: params::SB_BUDGET_PER_INT_VAR.saturating_mul(
+            problem
+                .var_domains
+                .iter()
+                .filter(|d| matches!(d, VarDomain::Integer | VarDomain::Boolean))
+                .count() as u64,
+        ),
         base: problem.clone(),
         fixed: BTreeMap::new(),
         classifying_unbounded: false,

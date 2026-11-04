@@ -1,6 +1,7 @@
 //! The search itself: visiting, branching, warm-starting and pruning nodes,
 //! and the loop that drives them until a termination reason is proven.
 
+use super::branching::Choice;
 use super::node::{with_var_bounds, Node};
 use super::params;
 use super::sos::{self, Point, Split};
@@ -256,25 +257,8 @@ fn branch_var(state: &mut MipState, parent: &Node, var: usize) {
     let lattice_bound = state.lattice_bound(z);
     let val = state.solver.get_value(var);
     let (lo, hi) = state.solver.get_var_bounds(var);
-    // The split point k (children: x ≤ k and x ≥ k + 1) must be
-    // noise-robust: a raw `val.floor()` of a within-tolerance-integral value
-    // is catastrophic — floor(−8e-16) = −1 makes the up child
-    // (max(0, lo), hi) reproduce the parent VERBATIM and the search
-    // descends forever. Reachable through the rejected-candidate re-branch
-    // path (`choose_branch_var` at int_tol = 0) whenever LP noise puts an
-    // integer var a hair below an integer. Take near-integral values at
-    // their integer first, then clamp k into [lo, hi − 1] so BOTH children
-    // strictly tighten the parent's [lo, hi] whenever hi − lo ≥ 1
-    // (integral bounds — guaranteed for branchable vars).
-    let floor = {
-        let near = val.round();
-        let k = if (val - near).abs() <= state.options.int_tol {
-            near
-        } else {
-            val.floor()
-        };
-        k.clamp(lo, (hi - 1.0).max(lo))
-    };
+    // Noise-robust, so that both children tighten [lo, hi] (see split_point).
+    let floor = branching::split_point(val, (lo, hi), state.options.int_tol);
     let f_down = (val - floor).clamp(0.0, 1.0);
 
     state.node_seq += 1;
@@ -579,8 +563,16 @@ fn initialize_root(
             }
         }
     } else {
-        let decision = non_candidate_branch(state, domains, int_tol);
-        branch(state, &root, decision);
+        match non_candidate_branch(state, domains, int_tol)? {
+            Some(decision) => branch(state, &root, decision),
+            None => {
+                // The root goes on the frontier as a node, whose LP a resume
+                // solves again from the root's basis.
+                state.open.push(root);
+                state.last_solved_id = None;
+                return Ok(Some(TerminationReason::TimeLimit));
+            }
+        }
     }
 
     Ok(None)
@@ -650,8 +642,15 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
         return Ok(NodeVisit::Solved);
     }
 
-    let decision = non_candidate_branch(state, domains, int_tol);
-    branch(state, &node, decision);
+    match non_candidate_branch(state, domains, int_tol)? {
+        Some(decision) => branch(state, &node, decision),
+        None => {
+            return Ok(NodeVisit::Interrupted {
+                node,
+                lp_solved: true,
+            })
+        }
+    }
     Ok(NodeVisit::Solved)
 }
 
@@ -659,10 +658,25 @@ fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result
 /// bound contract: one exists, since `branching::is_integral` weighs only the
 /// vars the search can branch on, and a set violated within the contract
 /// counts two members beyond it, neither fixed at zero.
-fn non_candidate_branch(state: &MipState, domains: &[VarDomain], int_tol: f64) -> Branch {
+/// An integer var is chosen by reliability branching
+/// (`branching::select_branch_var`), whose probes leave the solver at the
+/// node's optimum; `None` when the deadline struck before they could, and the
+/// node's LP must be solved again.
+fn non_candidate_branch(
+    state: &mut MipState,
+    domains: &[VarDomain],
+    int_tol: f64,
+) -> Result<Option<Branch>, Error> {
     let zero_tol = Some(state.options.tolerances.feasibility);
-    choose_branch(state, domains, int_tol, zero_tol)
-        .expect("a point that is no candidate has an integer var or a set to branch on")
+    match branching::select_branch_var(state, domains, int_tol)? {
+        Choice::Var(var) => Ok(Some(Branch::Var(var))),
+        Choice::Interrupted => Ok(None),
+        Choice::None => Ok(Some(
+            sos::solver_split(&state.base.sos, &state.solver, zero_tol)
+                .map(Branch::Sos)
+                .expect("a point that is no candidate has an integer var or a set to branch on"),
+        )),
+    }
 }
 
 pub(crate) fn search_loop(state: &mut MipState) -> Result<TerminationReason, Error> {

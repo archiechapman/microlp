@@ -224,6 +224,10 @@ pub(crate) struct Solver {
     pub(crate) operation_time_limit: Option<Duration>,
     /// Total number of simplex pivots performed across all solves/reoptimizes on this instance.
     pub(crate) lp_iterations: u64,
+    /// The value of [`Self::lp_iterations`] at which a phase stops with
+    /// [`StopReason::Limit`], as at the deadline; `None` for no cap. Set
+    /// around a solve that must stay cheap ([`Self::set_iteration_limit`]).
+    iteration_limit: Option<u64>,
     /// Wall-clock time accumulated by public pure-LP operations.
     pub(crate) elapsed: Duration,
 
@@ -784,6 +788,7 @@ impl Solver {
             deadline,
             operation_time_limit: None,
             lp_iterations: 0,
+            iteration_limit: None,
             elapsed: Duration::ZERO,
             orig_var_domains: var_domains.to_vec(),
             enable_primal_steepest_edge,
@@ -1361,6 +1366,20 @@ impl Solver {
     /// (only happens after loosening bounds or a numerically imperfect basis load).
     pub(crate) fn reoptimize(&mut self) -> Result<StopReason, Error> {
         self.run_phases()
+    }
+
+    /// Cap the solves that follow at `iterations` further simplex iterations:
+    /// a phase that reaches the cap stops as it does at the deadline, with
+    /// [`StopReason::Limit`] and its working costs or bounds restored. `None`
+    /// lifts the cap. A strong-branching probe sets it around its re-solve.
+    pub(crate) fn set_iteration_limit(&mut self, iterations: Option<u64>) {
+        self.iteration_limit = iterations.map(|n| self.lp_iterations.saturating_add(n));
+    }
+
+    /// Whether the cap of [`Self::set_iteration_limit`] is reached.
+    fn iterations_exhausted(&self) -> bool {
+        self.iteration_limit
+            .is_some_and(|limit| self.lp_iterations >= limit)
     }
 
     /// Alternate the dual (primal-feasibility) and primal (optimality) phases
@@ -2390,6 +2409,9 @@ impl Solver {
         // The objective at the last stall check.
         let mut stall_reference = self.cur_obj_val;
         for iter in 0.. {
+            if self.iterations_exhausted() {
+                return Ok((StopReason::Limit, pivoted));
+            }
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {
@@ -2657,6 +2679,9 @@ impl Solver {
         let mut last_resort_tried: Option<usize> = None;
 
         for iter in 0.. {
+            if self.iterations_exhausted() {
+                return Ok(StopReason::Limit);
+            }
             self.lp_iterations += 1;
             if iter % DEADLINE_CHECK_INTERVAL == 0 {
                 if check_deadline(&self.deadline) == StopReason::Limit {

@@ -53,6 +53,9 @@ pub(crate) struct MipState {
     /// Learned per-variable branching degradation estimates, updated after each
     /// node LP solve and consulted by `branching::choose_branch_var`.
     pub pseudocosts: branching::PseudoCosts,
+    /// Strong-branching probes this search may still run
+    /// (`SolveOptions::strong_branch_reliability`).
+    pub sb_budget: u64,
     /// Clean copy of the user's problem, including post-solve edits — never
     /// contains branching artifacts. Post-solve edits re-solve from this.
     pub base: Problem,

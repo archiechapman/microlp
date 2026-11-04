@@ -640,6 +640,30 @@ degradation per unit of fractionality observed across solved child nodes.
   gracefully to most-fractional.
 - *Dive order*: of the two children, the one with the LOWER estimated degradation is pushed
   last (popped first) — dive toward the side more likely to stay feasible and good.
+- *Reliability branching* (`select_branch_var`, opt-in through
+  `SolveOptions::strong_branch_reliability`): pseudocosts are least reliable at the top of
+  the tree, where the decision matters most. Before choosing, the node probes the best
+  `SB_MAX_CANDIDATES` candidates (by product score) that have fewer observations than the
+  threshold in either direction: each probe sets the child's bound and re-solves, warm from
+  wherever the last probe ended, under an iteration cap (`Solver::set_iteration_limit`,
+  which stops a phase as the deadline does, its working costs or bounds restored), then
+  records `max(0, z_probe − z_node) / frac` as an observation; after an error or an
+  infeasible child the next probe starts from the node's basis. A probe that reaches the
+  cap, the deadline, or an error records nothing. A probe that proves a child infeasible
+  picks that variable at once. Otherwise the variable chosen maximizes the product rule on
+  the probes' own objective changes (a probed candidate) or on the pseudocosts (a reliable
+  one); an unreliable candidate left unprobed has only its initial estimate, which would
+  outrank measured ones arbitrarily, so it is chosen only when nothing else is scored
+  (choosing by pseudocost score after probing let such estimates pick the variable, and
+  grew gt2's tree from 3,831 nodes to over a million). Probes only choose: they close no
+  node, so a node budget counts only
+  solved nodes, and `node_limit = 0` still solves none. After probing, the node's basis is
+  loaded and re-solved (which only verifies it unless the load repaired it), so the branch
+  reads the node's optimum and its children may dive warm; if the deadline strikes during
+  that re-solve, the node goes back on the frontier (the root too) and its LP is solved
+  again on resume. A search-wide budget of `SB_BUDGET_PER_INT_VAR` probes per integer
+  variable backstops models whose pseudocosts never settle. The rejected-candidate
+  re-branch (`int_tol = 0`) and set splits do not probe.
 
 ### 5.7 Warm starts
 

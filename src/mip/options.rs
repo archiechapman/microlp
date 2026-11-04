@@ -105,6 +105,23 @@ pub struct SolveOptions {
     /// [`SolveOptions::warm_start`] hint turns it off, so that a feasible hint
     /// is never excluded. Default `true`.
     pub dual_fixing: bool,
+    /// Reliability branching: before branching on an integer variable whose
+    /// pseudocosts rest on fewer than this many observations in either
+    /// direction, the search solves both of its children's LPs (strong
+    /// branching), records their objective changes as observations, and
+    /// branches on the variable whose probes moved the objective most (or
+    /// on a reliable variable's pseudocosts, if they score higher). A child
+    /// shown infeasible makes that variable the branching variable.
+    /// Probes only choose the variable: they close no node, and a node budget
+    /// counts only the nodes the search solves. Each node probes at most 8
+    /// candidates, each probe at most 100 simplex iterations, and a search at
+    /// most 20 probes per integer variable, so probing fades out once the
+    /// pseudocosts are reliable. Probes are counted in
+    /// [`Stats::strong_branch_lps`]. A probe costs about what a node LP
+    /// costs, so it pays where node LPs are cheap against the tree they save:
+    /// it can halve the nodes of a search, or multiply its time on a large
+    /// model whose every LP is dear. `0` turns it off. Default `0`.
+    pub strong_branch_reliability: u32,
     /// The tolerances of the solve. Most callers should leave this at
     /// [`Tolerances::default`]; override an individual field only once you
     /// understand the correctness/permissiveness trade-off documented on it.
@@ -121,6 +138,7 @@ impl Default for SolveOptions {
             warm_start: None,
             presolve: true,
             dual_fixing: true,
+            strong_branch_reliability: 0,
             tolerances: Tolerances::default(),
         }
     }
@@ -270,4 +288,8 @@ pub struct Stats {
     /// Relative gap between incumbent and best bound. `None` until both are
     /// known; `Some(0.0)` once optimality is proven.
     pub gap: Option<f64>,
+    /// Child LPs solved to choose a branching variable
+    /// ([`SolveOptions::strong_branch_reliability`]), not counted in
+    /// `nodes_solved`; their iterations count in `lp_iterations`.
+    pub strong_branch_lps: u64,
 }
