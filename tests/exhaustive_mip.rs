@@ -899,3 +899,18 @@ fn node_propagation_matches_exhaustive_enumeration() {
         o.strong_branch_reliability = 4;
     });
 }
+
+/// Root Gomory cuts tighten the relaxation and change nothing else: the
+/// optimum and the infeasible verdict match, alone and beside reliability
+/// branching and node propagation.
+#[test]
+fn root_cuts_match_exhaustive_enumeration() {
+    let stats = assert_matches_enumeration(|o| o.gomory_rounds = 5);
+    let cut = stats.iter().filter(|s| s.root_cuts > 0).count();
+    assert!(cut >= 100, "only {cut} searches added cuts");
+    assert_matches_enumeration(|o| {
+        o.gomory_rounds = 5;
+        o.node_propagation = true;
+        o.strong_branch_reliability = 4;
+    });
+}

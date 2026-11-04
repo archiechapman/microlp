@@ -1197,3 +1197,124 @@ fn dual_fixing_off_keeps_a_tied_alternative_optimum() {
         "y's root range [{lo}, {hi}] does not contain [0, 3]"
     );
 }
+
+/// Root Gomory cuts are valid: on random small models with general integer
+/// vars and one continuous var, every integer point that meets the rows
+/// exactly, for some value of the continuous var within its bounds, meets
+/// every cut of every round, at that value too (a cut is linear in the
+/// continuous var, so checking both ends of its feasible interval suffices).
+#[test]
+fn root_gomory_cuts_keep_every_integer_point() {
+    use rand::prelude::*;
+    let mut checked = 0;
+    for seed in 0..3000u64 {
+        let mut rng = rand_pcg::Pcg64::seed_from_u64(seed);
+        let n = rng.random_range(2..=4usize);
+        let mut p = Problem::new(OptimizationDirection::Minimize);
+        let bounds: Vec<(i32, i32)> = (0..n)
+            .map(|_| (rng.random_range(-2..=0), rng.random_range(1..=3)))
+            .collect();
+        let vars: Vec<Variable> = bounds
+            .iter()
+            .map(|&b| p.add_integer_var(rng.random_range(-5..=5) as f64, b))
+            .collect();
+        let z_hi = 2.5;
+        let z = p.add_var(0.5 * rng.random_range(-3..=3) as f64, (0.0, z_hi));
+        let mut rows = Vec::new();
+        for _ in 0..rng.random_range(1..=3) {
+            let a: Vec<f64> = (0..n).map(|_| rng.random_range(-6..=6) as f64).collect();
+            let b = 0.5 * rng.random_range(-3..=3) as f64;
+            let op = [ComparisonOp::Le, ComparisonOp::Ge, ComparisonOp::Eq][rng.random_range(0..3)];
+            let rhs = rng.random_range(-8..=8) as f64;
+            let mut terms: Vec<(Variable, f64)> =
+                vars.iter().copied().zip(a.iter().copied()).collect();
+            terms.push((z, b));
+            p.add_constraint(&terms[..], op, rhs);
+            rows.push((a, b, op, rhs));
+        }
+        let mut options = SolveOptions::default();
+        options.presolve = false;
+        let Ok(mut state) = build_state(&p, options) else {
+            continue;
+        };
+        if !matches!(state.solver.initial_solve(), Ok(StopReason::Finished)) {
+            continue;
+        }
+        // The feasible interval of z at integer point x, if any.
+        let z_range = |x: &[f64]| -> Option<(f64, f64)> {
+            let (mut lo, mut hi) = (0.0_f64, z_hi);
+            for (a, b, op, rhs) in &rows {
+                let ax: f64 = a.iter().zip(x).map(|(a, x)| a * x).sum();
+                let rest = rhs - ax;
+                if *b == 0.0 {
+                    let ok = match op {
+                        ComparisonOp::Le => rest >= 0.0,
+                        ComparisonOp::Ge => rest <= 0.0,
+                        ComparisonOp::Eq => rest == 0.0,
+                    };
+                    if !ok {
+                        return None;
+                    }
+                    continue;
+                }
+                let q = rest / b;
+                let (upper, lower) = match (op, *b > 0.0) {
+                    (ComparisonOp::Eq, _) => (true, true),
+                    (ComparisonOp::Le, true) | (ComparisonOp::Ge, false) => (true, false),
+                    _ => (false, true),
+                };
+                if upper {
+                    hi = hi.min(q);
+                }
+                if lower {
+                    lo = lo.max(q);
+                }
+            }
+            (lo <= hi).then_some((lo, hi))
+        };
+        let points: Vec<Vec<f64>> = bounds.iter().fold(vec![vec![]], |acc, &(lo, hi)| {
+            acc.into_iter()
+                .flat_map(|prefix| {
+                    (lo..=hi).map(move |v| {
+                        let mut p = prefix.clone();
+                        p.push(v as f64);
+                        p
+                    })
+                })
+                .collect()
+        });
+        for _ in 0..3 {
+            let cuts = state.solver.gomory_cuts(10);
+            if cuts.is_empty() {
+                break;
+            }
+            for (coeffs, rhs) in &cuts {
+                for x in &points {
+                    let Some((zl, zh)) = z_range(x) else { continue };
+                    for zv in [zl, zh] {
+                        let mut value = 0.0;
+                        for (k, &c) in coeffs.iter() {
+                            value += c * if k < n { x[k] } else { zv };
+                        }
+                        assert!(
+                            value >= rhs - 1e-9 * (1.0 + rhs.abs()),
+                            "seed {seed}: cut {coeffs:?} >= {rhs} cuts off x = {x:?}, z = {zv}"
+                        );
+                    }
+                }
+                checked += 1;
+            }
+            let mut failed = false;
+            for (coeffs, rhs) in cuts {
+                if !matches!(state.solver.add_cut(coeffs, rhs), Ok(StopReason::Finished)) {
+                    failed = true;
+                    break;
+                }
+            }
+            if failed {
+                break;
+            }
+        }
+    }
+    assert!(checked >= 500, "only {checked} cuts checked");
+}

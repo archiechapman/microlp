@@ -70,3 +70,8 @@ pub(crate) const SB_BUDGET_PER_INT_VAR: u64 = 20;
 /// can feed the next one's deductions, and a fixpoint is usually reached in
 /// two or three.
 pub(crate) const PROPAGATION_ROUNDS: usize = 5;
+
+/// A root cut round "stalls" when it raises the LP bound by less than this
+/// fraction of `max(1, |bound|)`; two stalled rounds in a row end the rounds
+/// (`search::root_cuts`).
+pub(crate) const GOMORY_STALL_REL: f64 = 1e-5;

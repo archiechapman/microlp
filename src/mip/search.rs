@@ -558,6 +558,57 @@ pub(crate) fn try_warm_start(
     Ok(None)
 }
 
+/// Root Gomory cut rounds (`SolveOptions::gomory_rounds`), before the first
+/// node's basis is stored: the frontier assumes a fixed row set. Each round
+/// adds up to one cut per ten rows (10 to 100), and the rounds together one
+/// per two rows. A round whose cuts make the LP fail, read infeasible or hit
+/// the deadline is undone whole, the solver restored to the root optimum it
+/// started from: a cut's round-off must never decide a verdict.
+fn root_cuts(state: &mut MipState, domains: &[VarDomain]) {
+    let rows = state.solver.num_constraints();
+    let per_round = (rows / 10).clamp(10, 100);
+    let mut budget = (rows / 2).max(per_round);
+    let mut stalls = 0;
+    for _ in 0..state.options.gomory_rounds {
+        if budget == 0 || is_candidate(state, domains, state.options.int_tol) {
+            break;
+        }
+        let cuts = state.solver.gomory_cuts(per_round.min(budget));
+        if cuts.is_empty() {
+            break;
+        }
+        let before = state.solver.cur_obj_val;
+        let backup = state.solver.clone();
+        let mut added = 0;
+        let mut failed = false;
+        for (coeffs, rhs) in cuts {
+            match state.solver.add_cut(coeffs, rhs) {
+                Ok(StopReason::Finished) => added += 1,
+                Ok(StopReason::Limit) | Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            debug!("root cuts: a round failed; undone");
+            state.solver = backup;
+            break;
+        }
+        state.stats.root_cuts += added as u64;
+        budget = budget.saturating_sub(added);
+        let after = state.solver.cur_obj_val;
+        if after - before <= params::GOMORY_STALL_REL * before.abs().max(1.0) {
+            stalls += 1;
+            if stalls >= 2 {
+                break;
+            }
+        } else {
+            stalls = 0;
+        }
+    }
+}
+
 /// Solve or resume the root relaxation, restore any advisory warm start, and
 /// either close the problem or seed the open tree. `None` means node processing
 /// can begin; `Some` is a completed or interrupted root outcome.
@@ -579,6 +630,7 @@ fn initialize_root(
             return Ok(Some(outcome));
         }
     }
+    root_cuts(state, domains);
 
     let root = Node {
         bound_changes: Vec::new(),

@@ -20,6 +20,7 @@ mod basis;
 mod bounds;
 mod costs;
 mod cycling;
+mod gomory;
 mod proof;
 mod scaling;
 mod tolerances;
@@ -228,6 +229,10 @@ pub(crate) struct Solver {
     /// [`StopReason::Limit`], as at the deadline; `None` for no cap. Set
     /// around a solve that must stay cheap ([`Self::set_iteration_limit`]).
     iteration_limit: Option<u64>,
+    /// Per engine row (absent: `false`), whether it is a cut
+    /// ([`Self::add_cut`]): implied by the model, so the validation of a
+    /// solution ([`Self::first_violated_row`]) skips it.
+    cut_rows: Vec<bool>,
     /// Wall-clock time accumulated by public pure-LP operations.
     pub(crate) elapsed: Duration,
 
@@ -789,6 +794,7 @@ impl Solver {
             operation_time_limit: None,
             lp_iterations: 0,
             iteration_limit: None,
+            cut_rows: Vec::new(),
             elapsed: Duration::ZERO,
             orig_var_domains: var_domains.to_vec(),
             enable_primal_steepest_edge,
@@ -1140,8 +1146,12 @@ impl Solver {
     /// `1e9`-scale big-M row counts; only its round-off floor is relative, to
     /// the row's activity. The rows presolve dropped or rewrote
     /// ([`Self::validation_rows`]) are then checked as the user wrote them.
+    /// Cut rows ([`Self::add_cut`]) are not checked: the model implies them.
     pub(crate) fn first_violated_row(&self, values: &[f64]) -> Option<(usize, f64)> {
         for r in 0..self.num_constraints() {
+            if self.cut_rows.get(r).copied().unwrap_or(false) {
+                continue;
+            }
             //guaranteed to be a valid index
             let row = self.orig_constraints.outer_view(r).unwrap();
             // `values` are in user units; dividing by the power-of-two `s_v`

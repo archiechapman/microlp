@@ -692,6 +692,38 @@ sums, and the quotient is rounded inward only past a further relative `1e-9`. So
 of the node whose integer vars are exactly integral and that meets the contract is kept, and
 a contradiction proves the node empty of such points.
 
+### 5.6c Root Gomory cuts (`src/solver/gomory.rs`)
+
+Opt-in through `SolveOptions::gomory_rounds`. `search::root_cuts` runs in `initialize_root`
+after the root LP and the warm start, before the root node's basis is stored: the frontier
+assumes a fixed row set (§12). Each round reads cuts off the optimal tableau
+(`Solver::gomory_cuts`), up to one per ten rows (10 to 100), and adds each as a row
+(`Solver::add_cut`, a `≥` row through the same preparation as any other, re-solved). The
+rounds end when the root point is a candidate, no cut passes the filters, a budget of one
+cut per two rows is spent, or two rounds in a row raise the bound by less than
+`GOMORY_STALL_REL`. A round whose cuts make the LP fail, read infeasible or meet the deadline
+is undone whole, the solver restored from a clone taken before it: a cut's round-off must
+never decide a verdict.
+
+A cut is formed in the engine's units and turned into user units: for a basic integer var
+`x_B` (scale `s_B`) at least `AWAY` from an integer, the tableau row
+`x'_B + Σ ᾱ_j x'_j = v'` becomes `x_B + Σ c_j t_j = v` in the non-basic vars' distances
+from the bounds they sit at (`c_j = s_B ᾱ_j / s_j` for a structural var, `s_B ᾱ_j` for a
+slack, whose distance stays in engine units), the GMI inequality `Σ g_j t_j ≥ 1` is formed,
+and each distance is replaced by its var (`x − lo`, `hi − x`) or, for a slack, by its row
+(`b' − Σ (a'_k / s_k) x_k`, `±` by the bound it sits at). Rows with a non-basic var strictly
+between its bounds are skipped. Negligible coefficients are removed with the var's bounds,
+cuts with a coefficient range above `MAX_DYNAMISM` or efficacy below `MIN_EFFICACY` are
+dropped, and each right-hand side is lowered by `SAFETY` times its magnitude against the
+tableau's round-off.
+
+Cut rows are flagged (`Solver::cut_rows`), and `first_violated_row` skips them: the model
+implies them, so a solution is still validated against the model as written, and a cut's
+round-off can never reject one. Cuts are valid for the root's bounds, which hold throughout
+the search, and for the special ordered sets too, which only restrict the points further. A
+search rebuilt from the user's problem (an edit, the unbounded classification, the final LP
+that prices a solution) has no cuts.
+
 ### 5.7 Warm starts
 
 `SolveOptions::warm_start` accepts a (possibly partial) assignment. Evaluation happens once,
@@ -1705,10 +1737,8 @@ dives a specific home:
 - **Reduced-cost fixing.** This belongs after a node LP solves and before candidate/branch
   inspection. Any bound change requires a reoptimization before integrality or branching
   reads the solver values.
-- **Root cuts.** Root cut rounds belong in `initialize_root` before the first open node and
-  its basis are snapshotted. Once the frontier exists, the row set must remain fixed because
-  every stored basis is sized for it. Accepted cuts should use the same row-preparation
-  contract as other solver rows.
+- **Root cuts**: Gomory mixed-integer cuts are implemented (§5.6c); other families (covers,
+  MIR on the rows as written) would go through the same `Solver::add_cut`.
 - **Primal heuristics.** A bounded dive can run after a valid root or node LP. It must restore
   the search bounds/basis bookkeeping and submit a completed solver point through
   `try_adopt_incumbent(state)`; heuristic candidates receive no validation shortcut.

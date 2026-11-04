@@ -130,6 +130,16 @@ pub struct SolveOptions {
     /// keeps each point within [`Tolerances::feasibility`], so it closes no
     /// node holding a solution. Default `false`.
     pub node_propagation: bool,
+    /// Rounds of Gomory mixed-integer cuts at the root of a search: each
+    /// round reads cuts off the root LP's optimal tableau and adds them as
+    /// rows, which tighten the relaxation for the whole search. The rounds
+    /// stop early when the root's point is integral, no cut passes the
+    /// filters, a budget of about one cut per two rows is spent, or two
+    /// rounds in a row barely move the bound; a round whose cuts make the LP
+    /// fail or read infeasible is undone. A solution is still checked
+    /// against the model as written, not against the cuts. `0` turns them
+    /// off. Default `0`.
+    pub gomory_rounds: u32,
     /// The tolerances of the solve. Most callers should leave this at
     /// [`Tolerances::default`]; override an individual field only once you
     /// understand the correctness/permissiveness trade-off documented on it.
@@ -148,6 +158,7 @@ impl Default for SolveOptions {
             dual_fixing: true,
             strong_branch_reliability: 0,
             node_propagation: false,
+            gomory_rounds: 0,
             tolerances: Tolerances::default(),
         }
     }
@@ -304,4 +315,6 @@ pub struct Stats {
     /// Nodes closed by node propagation ([`SolveOptions::node_propagation`])
     /// without an LP; not counted in `nodes_solved`.
     pub propagation_prunes: u64,
+    /// Gomory cuts added at the root ([`SolveOptions::gomory_rounds`]).
+    pub root_cuts: u64,
 }
