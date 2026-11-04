@@ -56,6 +56,9 @@ pub(crate) struct MipState {
     /// Strong-branching probes this search may still run
     /// (`SolveOptions::strong_branch_reliability`).
     pub sb_budget: u64,
+    /// The engine's rows that hold an integer var, for node propagation
+    /// (`SolveOptions::node_propagation`); empty when it is off.
+    pub prop_rows: super::propagate::PropModel,
     /// Clean copy of the user's problem, including post-solve edits — never
     /// contains branching artifacts. Post-solve edits re-solve from this.
     pub base: Problem,

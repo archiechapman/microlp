@@ -122,6 +122,14 @@ pub struct SolveOptions {
     /// it can halve the nodes of a search, or multiply its time on a large
     /// model whose every LP is dear. `0` turns it off. Default `0`.
     pub strong_branch_reliability: u32,
+    /// Node bound propagation: before each node's LP, the constraints, read
+    /// at the node's bounds, tighten the bounds of its integer variables
+    /// (rounded inward), and a node they show to hold no integer point is
+    /// closed without an LP. Its children inherit the tightened bounds. A
+    /// continuous variable's bounds are never changed, and every deduction
+    /// keeps each point within [`Tolerances::feasibility`], so it closes no
+    /// node holding a solution. Default `false`.
+    pub node_propagation: bool,
     /// The tolerances of the solve. Most callers should leave this at
     /// [`Tolerances::default`]; override an individual field only once you
     /// understand the correctness/permissiveness trade-off documented on it.
@@ -139,6 +147,7 @@ impl Default for SolveOptions {
             presolve: true,
             dual_fixing: true,
             strong_branch_reliability: 0,
+            node_propagation: false,
             tolerances: Tolerances::default(),
         }
     }
@@ -292,4 +301,7 @@ pub struct Stats {
     /// ([`SolveOptions::strong_branch_reliability`]), not counted in
     /// `nodes_solved`; their iterations count in `lp_iterations`.
     pub strong_branch_lps: u64,
+    /// Nodes closed by node propagation ([`SolveOptions::node_propagation`])
+    /// without an LP; not counted in `nodes_solved`.
+    pub propagation_prunes: u64,
 }

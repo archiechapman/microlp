@@ -15,6 +15,7 @@ mod lattice;
 pub(crate) mod node;
 mod options;
 pub(crate) mod params;
+mod propagate;
 mod search;
 pub(crate) mod sos;
 mod state;
@@ -81,6 +82,11 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
         deadline,
         options.tolerances.feasibility,
     )?;
+    let prop_rows = if options.node_propagation {
+        propagate::PropModel::new(constraints, &problem.var_domains)
+    } else {
+        propagate::PropModel::default()
+    };
     let root_bounds = var_mins
         .iter()
         .zip(var_maxs)
@@ -122,6 +128,7 @@ fn build_state(problem: &Problem, options: SolveOptions) -> Result<MipState, Err
                 .filter(|d| matches!(d, VarDomain::Integer | VarDomain::Boolean))
                 .count() as u64,
         ),
+        prop_rows,
         base: problem.clone(),
         fixed: BTreeMap::new(),
         classifying_unbounded: false,

@@ -65,3 +65,8 @@ pub(crate) const SB_MAX_ITERS_PER_LP: u64 = 100;
 /// Strong-branching probes allowed in one search, per integer variable: a
 /// backstop for models whose pseudocosts never become reliable.
 pub(crate) const SB_BUDGET_PER_INT_VAR: u64 = 20;
+
+/// Sweeps over the rows node propagation makes at most per node: each sweep
+/// can feed the next one's deductions, and a fixpoint is usually reached in
+/// two or three.
+pub(crate) const PROPAGATION_ROUNDS: usize = 5;

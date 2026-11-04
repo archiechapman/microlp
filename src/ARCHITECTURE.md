@@ -665,6 +665,33 @@ degradation per unit of fractionality observed across solved child nodes.
   variable backstops models whose pseudocosts never settle. The rejected-candidate
   re-branch (`int_tol = 0`) and set splits do not probe.
 
+### 5.6b Node propagation (`src/mip/propagate.rs`)
+
+Opt-in through `SolveOptions::node_propagation`. `visit_node` calls `propagate_node` after
+`apply_node_bounds` and before the node's LP. It works through a worklist of the engine's
+rows that hold an integer var (`MipState::prop_rows`, copied at `build_state`, in user
+units, with each var's rows), each visit tightening the integer vars `x_j` of a row
+`lo ≤ a·x ≤ hi` from the other terms' extreme activities at the node's bounds, rounded
+inward, and queueing every row of a var it tightened (that row too: its visit read the other
+terms at their old bounds), at most `PROPAGATION_ROUNDS` visits per row on average. A node
+inherits its parent's deductions, so the worklist starts from the rows of the var its branch
+changed (every row for a node a set split created, which moves several vars). Continuous
+bounds are never
+changed, as in presolve (§2). Deduced bounds are stored on the `Node` as the var's one entry
+(`with_var_bounds`), so children inherit them, applied to the solver and mirrored in
+`state.applied`; a contradiction applies nothing and closes the node as `Pruned`, with no LP
+solved, counted in `Stats::propagation_prunes`. Storing only integer vars bounds the entries
+per node by the number of integer vars, which keeps the frontier's memory in check (on a
+model with thousands of continuous vars, storing every deduction is what made an earlier
+version run out of memory).
+
+Soundness is a widening, not an exact computation: before dividing by `a_j`, the row's bound
+is widened by its contract at its magnitude, by what each other term can move past its
+bounds within their tolerances, and by `4 (n + 2) u m` against the round-off of the plain
+sums, and the quotient is rounded inward only past a further relative `1e-9`. So every point
+of the node whose integer vars are exactly integral and that meets the contract is kept, and
+a contradiction proves the node empty of such points.
+
 ### 5.7 Warm starts
 
 `SolveOptions::warm_start` accepts a (possibly partial) assignment. Evaluation happens once,
@@ -1673,11 +1700,8 @@ dives a specific home:
   API or come with a deliberate rebuild policy. Any new reduction must be exact (keep, up
   to round-off, every point within the engine's box with its integer vars exactly integral)
   and decide against the tolerance contract the way the existing ones do (§7.4).
-- **Node propagation.** Propagation belongs inside `visit_node`, after target bounds are
-  applied and before `solve_node_lp`. Deduced bounds must be stored on the `Node` (as the
-  var's one entry, `with_var_bounds`) so children inherit them, and `state.applied` must
-  mirror every partial tightening even when a contradiction prunes the node. The activity
-  arithmetic and its tolerance rules already live in `src/presolve/`.
+- **Node propagation** is implemented (§5.6b); what it could still add is a deduction on
+  continuous bounds that is only used, never applied, as presolve's working bounds are.
 - **Reduced-cost fixing.** This belongs after a node LP solves and before candidate/branch
   inspection. Any bound change requires a reoptimization before integrality or branching
   reads the solver values.

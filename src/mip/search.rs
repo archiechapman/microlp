@@ -4,6 +4,7 @@
 use super::branching::Choice;
 use super::node::{with_var_bounds, Node};
 use super::params;
+use super::propagate;
 use super::sos::{self, Point, Split};
 use super::state::{Incumbent, MipState};
 use super::{
@@ -183,6 +184,42 @@ fn apply_node_bounds(state: &mut MipState, node: &Node) -> bool {
             .expect("validated bounds cannot cross");
     }
     state.applied.clone_from(target);
+    true
+}
+
+/// Node propagation (`SolveOptions::node_propagation`, `super::propagate`)
+/// at the node's bounds, just applied: the tightened integer bounds are
+/// recorded on the node, so its children inherit them, applied to the
+/// solver and mirrored in `state.applied`. `false` when the node holds no
+/// point; nothing is applied then, and `state.applied` already mirrors the
+/// node's own bounds.
+fn propagate_node(state: &mut MipState, node: &mut Node, domains: &[VarDomain]) -> bool {
+    if state.prop_rows.is_empty() {
+        return true;
+    }
+    let mut bounds: Vec<(f64, f64)> = (0..state.solver.num_vars)
+        .map(|v| state.solver.get_var_bounds(v))
+        .collect();
+    let Ok(changed) = propagate::propagate(
+        &state.prop_rows,
+        domains,
+        &mut bounds,
+        state.options.tolerances.feasibility,
+        node.branch_var.as_ref().map(std::slice::from_ref),
+        params::PROPAGATION_ROUNDS,
+    ) else {
+        state.stats.propagation_prunes += 1;
+        return false;
+    };
+    for v in changed {
+        let (lo, hi) = bounds[v];
+        node.bound_changes = with_var_bounds(&node.bound_changes, v, lo, hi);
+        state
+            .solver
+            .set_var_bounds(v, lo, hi)
+            .expect("propagated bounds lie within the node's");
+    }
+    state.applied.clone_from(&node.bound_changes);
     true
 }
 
@@ -589,8 +626,12 @@ enum NodeVisit {
 }
 
 /// Reconstruct and process one node selected by the outer search policy.
-fn visit_node(state: &mut MipState, node: Node, domains: &[VarDomain]) -> Result<NodeVisit, Error> {
-    if !apply_node_bounds(state, &node) {
+fn visit_node(
+    state: &mut MipState,
+    mut node: Node,
+    domains: &[VarDomain],
+) -> Result<NodeVisit, Error> {
+    if !apply_node_bounds(state, &node) || !propagate_node(state, &mut node, domains) {
         state.diving = false;
         return Ok(NodeVisit::Pruned);
     }

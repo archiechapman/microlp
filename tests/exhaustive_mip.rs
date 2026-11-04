@@ -810,26 +810,22 @@ fn mixed_scale_branching_does_not_prune_the_true_optimum() {
     assert_solution(&case, &vars, 2_505, expected, &solution);
 }
 
-/// Reliability branching probes children before the search branches, which
-/// changes the tree and nothing else: the optimum and the infeasible verdict
-/// still match the enumeration, probes stay within their budget, and a
-/// search sliced by the node limit, its root alone then a node a call, ends
-/// on the optimum, since probes solve no node.
-#[test]
-fn reliability_branching_matches_exhaustive_enumeration() {
-    let mut probed = 0;
+/// The search with `configure` applied to its options against the
+/// enumeration: the optimum and the infeasible verdict match, and a search
+/// sliced by the node limit, its root alone then a node a call, ends on the
+/// optimum. Returns the stats of the unsliced integer-model solves.
+fn assert_matches_enumeration(configure: impl Fn(&mut SolveOptions)) -> Vec<microlp::Stats> {
+    let mut stats = Vec::new();
     for seed in 0..20_000 {
         let case = generated_case(seed);
         let expected = brute_force(&case);
         let (problem, vars, mut options) = build_problem(&case, None);
-        options.strong_branch_reliability = 4;
+        configure(&mut options);
         match (expected, problem.solve_with(options.clone())) {
             (None, Err(Error::Infeasible)) => {}
             (None, other) => panic!("seed {seed}: expected infeasible, got {other:?}; {case:?}"),
             (Some((objective, _)), Ok(outcome)) => {
-                let lps = outcome.stats().strong_branch_lps;
-                assert!(lps <= 20 * case.n as u64, "seed {seed}: {lps} probes");
-                probed += u64::from(lps > 0);
+                stats.push(outcome.stats());
                 let solution = expect_solution(outcome);
                 assert_solution(&case, &vars, seed, objective, &solution);
                 if seed % 25 == 0 {
@@ -851,14 +847,12 @@ fn reliability_branching_matches_exhaustive_enumeration() {
             }
         }
     }
-    assert!(probed >= 400, "only {probed} searches probed");
-
     for seed in 0..10_000 {
         let case = generated_mixed_case(seed);
         let expected = mixed_oracle(&case);
         let (problem, _) = build_mixed_problem(&case);
         let mut options = SolveOptions::default();
-        options.strong_branch_reliability = 4;
+        configure(&mut options);
         match (expected, problem.solve_with(options)) {
             (None, Err(Error::Infeasible)) => {}
             (None, other) => panic!("seed {seed}: expected infeasible, got {other:?}; {case:?}"),
@@ -876,4 +870,32 @@ fn reliability_branching_matches_exhaustive_enumeration() {
             }
         }
     }
+    stats
+}
+
+/// Reliability branching probes children before the search branches, which
+/// changes the tree and nothing else; probes stay within their budget and
+/// solve no node.
+#[test]
+fn reliability_branching_matches_exhaustive_enumeration() {
+    let stats = assert_matches_enumeration(|o| o.strong_branch_reliability = 4);
+    assert!(stats.iter().all(|s| s.strong_branch_lps <= 20 * 4));
+    let probed = stats.iter().filter(|s| s.strong_branch_lps > 0).count();
+    assert!(probed >= 400, "only {probed} searches probed");
+}
+
+/// Node propagation closes nodes and tightens integer bounds, which changes
+/// the tree and nothing else, alone and beside reliability branching.
+#[test]
+fn node_propagation_matches_exhaustive_enumeration() {
+    let stats = assert_matches_enumeration(|o| o.node_propagation = true);
+    let pruned = stats.iter().filter(|s| s.propagation_prunes > 0).count();
+    assert!(
+        pruned >= 100,
+        "only {pruned} searches pruned by propagation"
+    );
+    assert_matches_enumeration(|o| {
+        o.node_propagation = true;
+        o.strong_branch_reliability = 4;
+    });
 }
